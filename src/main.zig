@@ -22,6 +22,8 @@ const ADMIN_WAIT_GUARD: u32 = 10_000_000;
 const IO_WAIT_GUARD: u32 = 100_000_000;
 
 const ADMIN_OP_CREATE_IO_SQ: u8 = 0x01;
+const ADMIN_OP_DELETE_IO_SQ: u8 = 0x00;
+const ADMIN_OP_DELETE_IO_CQ: u8 = 0x04;
 const ADMIN_OP_CREATE_IO_CQ: u8 = 0x05;
 const ADMIN_OP_IDENTIFY: u8 = 0x06;
 const IDENTIFY_CNS_CONTROLLER: u32 = 0x01;
@@ -45,6 +47,8 @@ const CSTS_RDY: u32 = 1 << 0;
 const CSTS_CFS: u32 = 1 << 1;
 
 const ControllerState = struct {
+    api: ?*const r4os.r4dev.DriverApi = null,
+    info: r4os.abi.PciDeviceInfo = .{},
     present: bool = false,
     mapped: bool = false,
     mmio_virt: u64 = 0,
@@ -65,6 +69,13 @@ const ControllerState = struct {
     active_namespace_list_ok: bool = false,
     namespace_usable: bool = false,
     io_queue_configured: bool = false,
+    io_cq_created: bool = false,
+    io_sq_created: bool = false,
+    admin_command_pending: bool = false,
+    io_command_pending: bool = false,
+    shutting_down: bool = false,
+    shutdown_done: bool = false,
+    shutdown_safe: bool = false,
     block_device_count: usize = 0,
     queue_depth: u16 = 0,
     admin_sq_tail: u16 = 0,
@@ -136,12 +147,14 @@ export fn nvme_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
     }
 
     resetState();
+    state.api = api;
     const info = findNvme(&ctx) orelse {
         ctx.logWarn("NVME.R4D no NVMe controller found; preload boundary only");
         return 0;
     };
 
     state.present = true;
+    state.info = info;
     if (ctx.pciEnableBusMaster(info, r4os.abi.pci_enable_memory_space) != 0) {
         ctx.logWarn("NVME.R4D bus master enable failed; legacy rescue required");
         return 0;
@@ -149,6 +162,7 @@ export fn nvme_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
 
     if (ctx.pciMapBar(info, 0, MAP_BYTES, 0, &mmio) != 0 or mmio.virt_addr == 0) {
         ctx.logWarn("NVME.R4D BAR0 map failed; legacy rescue required");
+        _ = disablePciBusMaster(&ctx);
         return 0;
     }
 
@@ -157,12 +171,12 @@ export fn nvme_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
     readControllerRegisters();
     if (!initAdminPath(&ctx)) {
         ctx.logWarn("NVME.R4D admin/io init failed; legacy rescue required");
-        return 0;
+        return if (shutdownController(&ctx)) 0 else -4;
     }
 
     if (state.block_device_count == 0) {
         ctx.logWarn("NVME.R4D no namespace registered; legacy rescue required");
-        return 0;
+        return if (shutdownController(&ctx)) 0 else -5;
     }
 
     ctx.logInfo("NVME.R4D storage backend ready");
@@ -170,7 +184,9 @@ export fn nvme_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
 }
 
 export fn nvme_shutdown() callconv(.c) i32 {
-    return 0;
+    const api = state.api orelse return 0;
+    var ctx = r4os.r4dev.DriverContext.init(api);
+    return if (shutdownController(&ctx)) 0 else -1;
 }
 
 fn findNvme(ctx: *const r4os.r4dev.DriverContext) ?r4os.abi.PciDeviceInfo {
@@ -317,6 +333,7 @@ fn submitIdentifyCommand(nsid: u32, cns: u32, buffer_phys: u64) bool {
 }
 
 fn submitAdminCommand(opcode: u8, nsid: u32, prp1: u64, cdw10: u32, cdw11: u32) bool {
+    if (state.admin_command_pending) return failAdmin(73);
     const cid = allocateAdminCid();
     const tail = state.admin_sq_tail;
     const cmd = adminSqCommand(tail);
@@ -330,6 +347,7 @@ fn submitAdminCommand(opcode: u8, nsid: u32, prp1: u64, cdw10: u32, cdw11: u32) 
 
     state.last_admin_status = 0xFFFF;
     state.admin_commands += 1;
+    state.admin_command_pending = true;
     state.admin_sq_tail = nextQueueIndex(state.admin_sq_tail, state.queue_depth);
     dmaFence();
     write32(doorbellOffset(0, 0), state.admin_sq_tail);
@@ -360,14 +378,18 @@ fn createIoCompletionQueue() bool {
     const size_zero_based = @as(u32, state.io_queue_depth - 1);
     const cdw10 = @as(u32, IO_QUEUE_ID) | (size_zero_based << 16);
     const cdw11 = @as(u32, 1);
-    return submitAdminCommand(ADMIN_OP_CREATE_IO_CQ, 0, dma.iocq.phys_addr, cdw10, cdw11);
+    if (!submitAdminCommand(ADMIN_OP_CREATE_IO_CQ, 0, dma.iocq.phys_addr, cdw10, cdw11)) return false;
+    state.io_cq_created = true;
+    return true;
 }
 
 fn createIoSubmissionQueue() bool {
     const size_zero_based = @as(u32, state.io_queue_depth - 1);
     const cdw10 = @as(u32, IO_QUEUE_ID) | (size_zero_based << 16);
     const cdw11 = @as(u32, 1) | (@as(u32, IO_QUEUE_ID) << 16);
-    return submitAdminCommand(ADMIN_OP_CREATE_IO_SQ, 0, dma.iosq.phys_addr, cdw10, cdw11);
+    if (!submitAdminCommand(ADMIN_OP_CREATE_IO_SQ, 0, dma.iosq.phys_addr, cdw10, cdw11)) return false;
+    state.io_sq_created = true;
+    return true;
 }
 
 fn registerNamespaceBlockDevices(ctx: *const r4os.r4dev.DriverContext) bool {
@@ -417,6 +439,7 @@ fn registerBlockDevice(ctx: *const r4os.r4dev.DriverContext, ns: *NamespaceRunti
 }
 
 fn storageRead(ctx: ?*anyopaque, lba: u64, sectors: u32, out: [*]u8, len: u32) callconv(.c) i32 {
+    if (@atomicLoad(bool, &state.shutting_down, .acquire)) return -4;
     const ns = namespaceFromContext(ctx) orelse return -1;
     if (sectors > MAX_IO_SECTORS) return -2;
     const sector_count: u16 = @intCast(sectors);
@@ -425,6 +448,7 @@ fn storageRead(ctx: ?*anyopaque, lba: u64, sectors: u32, out: [*]u8, len: u32) c
 }
 
 fn storageWrite(ctx: ?*anyopaque, lba: u64, sectors: u32, data_ptr: [*]const u8, len: u32) callconv(.c) i32 {
+    if (@atomicLoad(bool, &state.shutting_down, .acquire)) return -4;
     const ns = namespaceFromContext(ctx) orelse return -1;
     if (sectors > MAX_IO_SECTORS) return -2;
     const sector_count: u16 = @intCast(sectors);
@@ -433,13 +457,16 @@ fn storageWrite(ctx: ?*anyopaque, lba: u64, sectors: u32, data_ptr: [*]const u8,
 }
 
 fn storageFlush(ctx: ?*anyopaque) callconv(.c) i32 {
+    if (@atomicLoad(bool, &state.shutting_down, .acquire)) return -3;
     const ns = namespaceFromContext(ctx) orelse return -1;
     return if (flushBlock(ns)) 0 else -2;
 }
 
 fn storageShutdown(ctx: ?*anyopaque) callconv(.c) i32 {
     _ = ctx;
-    return 0;
+    const api = state.api orelse return 0;
+    var driver_ctx = r4os.r4dev.DriverContext.init(api);
+    return if (shutdownController(&driver_ctx)) 0 else -1;
 }
 
 fn storageStatus(ctx: ?*anyopaque, out: *r4os.abi.StorageBackendStatus) callconv(.c) i32 {
@@ -479,6 +506,7 @@ fn flushBlock(ns: *NamespaceRuntime) bool {
 }
 
 fn submitIoCommand(nsid: u32, opcode: u8, lba: u64, sectors: u16, prp1: u64) bool {
+    if (state.io_command_pending) return failIo(82);
     const cid = allocateIoCid();
     const tail = state.io_sq_tail;
     const cmd = ioSqCommand(tail);
@@ -499,6 +527,7 @@ fn submitIoCommand(nsid: u32, opcode: u8, lba: u64, sectors: u16, prp1: u64) boo
     state.last_lba = lba;
     state.last_sectors = sectors;
     state.io_commands += 1;
+    state.io_command_pending = true;
     state.io_sq_tail = nextQueueIndex(state.io_sq_tail, state.io_queue_depth);
     dmaFence();
     write32(doorbellOffset(IO_QUEUE_ID, 0), state.io_sq_tail);
@@ -526,6 +555,7 @@ fn pollAdminCompletion(expected_cid: u16) bool {
         advanceAdminCqHead();
 
         if (completionCid(dw3) != expected_cid) return failAdmin(70);
+        state.admin_command_pending = false;
         if (state.last_admin_status != 0) return failAdmin(71);
         return true;
     }
@@ -557,6 +587,7 @@ fn pollIoCompletion(expected_cid: u16) bool {
             state.io_cid_mismatches += 1;
             continue;
         }
+        state.io_command_pending = false;
         if (state.last_io_status != 0) return failIo(80);
         return true;
     }
@@ -628,12 +659,99 @@ fn waitReady(want_ready: bool) bool {
     while (guard < ADMIN_WAIT_GUARD) : (guard += 1) {
         const csts = read32(REG_CSTS);
         state.csts = csts;
-        if ((csts & CSTS_CFS) != 0) return false;
         const ready = (csts & CSTS_RDY) != 0;
         if (ready == want_ready) return true;
+        if (want_ready and (csts & CSTS_CFS) != 0) return false;
     }
     state.admin_timeouts += 1;
     return false;
+}
+
+fn shutdownController(ctx: *const r4os.r4dev.DriverContext) bool {
+    if (state.shutdown_done) return state.shutdown_safe;
+    @atomicStore(bool, &state.shutting_down, true, .release);
+
+    var graceful = true;
+    if (state.mapped and state.controller_ready and !state.io_command_pending) {
+        for (&namespaces) |*ns| {
+            if (!ns.usable) continue;
+            if (!flushBlock(ns)) graceful = false;
+            if (state.io_command_pending) break;
+        }
+    } else if (state.io_command_pending) {
+        graceful = false;
+    }
+
+    if (state.mapped and state.controller_ready and !state.io_command_pending and !state.admin_command_pending) {
+        if (state.io_sq_created) {
+            if (submitAdminCommand(ADMIN_OP_DELETE_IO_SQ, 0, 0, IO_QUEUE_ID, 0)) {
+                state.io_sq_created = false;
+            } else {
+                graceful = false;
+            }
+        }
+        if (!state.io_sq_created and state.io_cq_created and !state.admin_command_pending) {
+            if (submitAdminCommand(ADMIN_OP_DELETE_IO_CQ, 0, 0, IO_QUEUE_ID, 0)) {
+                state.io_cq_created = false;
+            } else {
+                graceful = false;
+            }
+        }
+    } else if (state.admin_command_pending) {
+        graceful = false;
+    }
+
+    var controller_stopped = true;
+    if (state.mapped) {
+        controller_stopped = disableController();
+        if (controller_stopped) {
+            write32(REG_AQA, 0);
+            write64(REG_ASQ, 0);
+            write64(REG_ACQ, 0);
+            state.admin_queue_configured = false;
+            state.io_queue_configured = false;
+            state.io_sq_created = false;
+            state.io_cq_created = false;
+        }
+    }
+    const bus_master_disabled = disablePciBusMaster(ctx);
+    const safe = controller_stopped and bus_master_disabled;
+    if (safe) {
+        freeDmaState(ctx);
+        state.present = false;
+        state.namespace_usable = false;
+        for (&namespaces) |*ns| ns.usable = false;
+    }
+    if (!graceful) ctx.logWarn("NVME.R4D graceful queue shutdown incomplete; controller halt used");
+    state.shutdown_safe = safe;
+    state.shutdown_done = safe;
+    return safe;
+}
+
+fn disablePciBusMaster(ctx: *const r4os.r4dev.DriverContext) bool {
+    if (!state.present) return true;
+    const raw = ctx.pciReadConfig32(state.info, 0x04);
+    if (raw == 0xFFFF_FFFF) return false;
+    if ((raw & 0x0004) == 0) return true;
+    const command = (raw & 0x0000_FFFF) & ~@as(u32, 0x0004);
+    if (ctx.pciWriteConfig32(state.info, 0x04, command) != 0) return false;
+    const verified = ctx.pciReadConfig32(state.info, 0x04);
+    return verified != 0xFFFF_FFFF and (verified & 0x0004) == 0;
+}
+
+fn freeDmaState(ctx: *const r4os.r4dev.DriverContext) void {
+    const buffers = [_]*r4os.abi.DmaBuffer{
+        &dma.io,
+        &dma.iocq,
+        &dma.iosq,
+        &dma.namespace,
+        &dma.identify,
+        &dma.acq,
+        &dma.asq,
+    };
+    for (buffers) |buffer| {
+        if (buffer.phys_addr != 0) ctx.freeDmaRegion(buffer);
+    }
 }
 
 fn failAdmin(error_code: u32) bool {

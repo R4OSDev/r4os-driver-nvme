@@ -1,6 +1,21 @@
 ﻿NVME.R4D
 ========
 
+Lebenszyklus seit 0.69.17
+-------------------------
+
+Der Shutdown schliesst zuerst neue Storage-Aufrufe, versucht alle nutzbaren
+Namespaces zu flushen und loescht die I/O Submission- und Completion-Queue.
+Unabhaengig vom Ergebnis dieser Komfortschritte wird der Controller ueber
+CC.EN=0 angehalten. DMA wird nur freigegeben, wenn CSTS.RDY=0 gelesen und PCI
+Bus Mastering nachweislich abgeschaltet wurde. Offene oder zeitueberschrittene
+Commands fuehren deshalb nicht zu Use-after-free: bei fehlendem Haltbeweis
+bleiben die Seiten fuer einen spaeteren Retry quarantainisiert.
+
+Auch partielle Initialisierung und der Legacy-Rescue-Fallback benutzen diesen
+Abbau. Storage-Backend-Finalizer liefern das gecachte sichere Ergebnis und
+greifen nach dem Top-Level-Shutdown nicht erneut auf DMA-Queues zu.
+
 Projektstruktur seit 0.51.22
 --------------------------------
 

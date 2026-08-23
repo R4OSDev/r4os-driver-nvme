@@ -10,4 +10,16 @@ pub fn build(b: *std.Build) void {
     const sdk_dep = b.dependencyFromBuildZig(sdk_build, .{});
     const sdk = sdk_build.sdk(b, sdk_dep, .{});
     _ = sdk.addR4MF(b.path("module.R4MF"));
+
+    const state_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/nvme_state.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run_state_tests = b.addRunArtifact(state_tests);
+    const test_step = b.step("test", "Run deterministic NVMe deadline and recovery-state tests");
+    test_step.dependOn(b.getInstallStep());
+    test_step.dependOn(&run_state_tests.step);
 }

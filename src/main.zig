@@ -1,4 +1,5 @@
 const r4os = @import("r4os");
+const nvme_state = @import("nvme_state.zig");
 
 const CLASS_MASS_STORAGE: u8 = 0x01;
 const SUBCLASS_NVME: u8 = 0x08;
@@ -18,14 +19,12 @@ const PAGE_SIZE: u32 = 4096;
 const ADMIN_QUEUE_DEPTH: u16 = 16;
 const ADMIN_COMMAND_DWORDS: usize = 16;
 const ADMIN_COMPLETION_BYTES: u64 = 16;
-const ADMIN_WAIT_GUARD: u32 = 10_000_000;
-const IO_WAIT_GUARD: u32 = 100_000_000;
-
 const ADMIN_OP_CREATE_IO_SQ: u8 = 0x01;
 const ADMIN_OP_DELETE_IO_SQ: u8 = 0x00;
 const ADMIN_OP_DELETE_IO_CQ: u8 = 0x04;
 const ADMIN_OP_CREATE_IO_CQ: u8 = 0x05;
 const ADMIN_OP_IDENTIFY: u8 = 0x06;
+const ADMIN_OP_ABORT: u8 = 0x08;
 const IDENTIFY_CNS_CONTROLLER: u32 = 0x01;
 const IDENTIFY_CNS_ACTIVE_NAMESPACE_LIST: u32 = 0x02;
 const NVM_OP_FLUSH: u8 = 0x00;
@@ -46,6 +45,22 @@ const CC_IOCQES_16: u32 = 4 << 20;
 const CSTS_RDY: u32 = 1 << 0;
 const CSTS_CFS: u32 = 1 << 1;
 
+const WaitOutcome = enum {
+    success,
+    command_failed,
+    timeout,
+    fatal,
+    invalid,
+};
+
+const IoCommand = struct {
+    nsid: u32,
+    opcode: u8,
+    lba: u64,
+    sectors: u16,
+    prp1: u64,
+};
+
 const ControllerState = struct {
     api: ?*const r4os.r4dev.DriverApi = null,
     info: r4os.abi.PciDeviceInfo = .{},
@@ -53,6 +68,8 @@ const ControllerState = struct {
     mapped: bool = false,
     mmio_virt: u64 = 0,
     cap: u64 = 0,
+    timer_hz: u32 = 0,
+    timeout_units: u8 = 0,
     vs: u32 = 0,
     cc: u32 = 0,
     csts: u32 = 0,
@@ -99,6 +116,7 @@ const ControllerState = struct {
     last_lba: u64 = 0,
     last_sectors: u32 = 0,
     last_error: u32 = 0,
+    machine: nvme_state.Machine = .{},
 };
 
 const NamespaceRuntime = extern struct {
@@ -148,35 +166,47 @@ export fn nvme_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
 
     resetState();
     state.api = api;
+    state.timer_hz = ctx.timerFrequency();
+    if (state.timer_hz == 0) {
+        ctx.logError("NVME.R4D monotonic timer unavailable");
+        state.machine.markFailed();
+        return -4;
+    }
+    state.machine.markInitializing();
     const info = findNvme(&ctx) orelse {
         ctx.logWarn("NVME.R4D no NVMe controller found; preload boundary only");
+        state.machine.markStopped();
         return 0;
     };
 
     state.present = true;
     state.info = info;
     if (ctx.pciEnableBusMaster(info, r4os.abi.pci_enable_memory_space) != 0) {
-        ctx.logWarn("NVME.R4D bus master enable failed; legacy rescue required");
-        return 0;
+        ctx.logError("NVME.R4D bus master enable failed");
+        state.machine.markFailed();
+        return -5;
     }
 
     if (ctx.pciMapBar(info, 0, MAP_BYTES, 0, &mmio) != 0 or mmio.virt_addr == 0) {
-        ctx.logWarn("NVME.R4D BAR0 map failed; legacy rescue required");
+        ctx.logError("NVME.R4D BAR0 map failed");
         _ = disablePciBusMaster(&ctx);
-        return 0;
+        state.machine.markFailed();
+        return -6;
     }
 
     state.mapped = true;
     state.mmio_virt = mmio.virt_addr;
     readControllerRegisters();
     if (!initAdminPath(&ctx)) {
-        ctx.logWarn("NVME.R4D admin/io init failed; legacy rescue required");
-        return if (shutdownController(&ctx)) 0 else -4;
+        ctx.logError("NVME.R4D admin/io init failed");
+        _ = shutdownController(&ctx);
+        return -7;
     }
 
     if (state.block_device_count == 0) {
-        ctx.logWarn("NVME.R4D no namespace registered; legacy rescue required");
-        return if (shutdownController(&ctx)) 0 else -5;
+        ctx.logError("NVME.R4D no namespace registered");
+        _ = shutdownController(&ctx);
+        return -8;
     }
 
     ctx.logInfo("NVME.R4D storage backend ready");
@@ -333,8 +363,20 @@ fn submitIdentifyCommand(nsid: u32, cns: u32, buffer_phys: u64) bool {
 }
 
 fn submitAdminCommand(opcode: u8, nsid: u32, prp1: u64, cdw10: u32, cdw11: u32) bool {
-    if (state.admin_command_pending) return failAdmin(73);
+    return submitAdminCommandOutcome(opcode, nsid, prp1, cdw10, cdw11) == .success;
+}
+
+fn submitAdminCommandOutcome(opcode: u8, nsid: u32, prp1: u64, cdw10: u32, cdw11: u32) WaitOutcome {
+    if (state.admin_command_pending) {
+        _ = failAdmin(73);
+        return .invalid;
+    }
     const cid = allocateAdminCid();
+    const ctx = context();
+    if (!state.machine.begin(.admin, cid, ctx.tickCount(), nvme_state.adminTimeoutTicks(state.timer_hz))) {
+        _ = failAdmin(74);
+        return .invalid;
+    }
     const tail = state.admin_sq_tail;
     const cmd = adminSqCommand(tail);
     @memset(cmd[0..ADMIN_COMMAND_DWORDS], 0);
@@ -360,6 +402,7 @@ fn initIoPath(ctx: *const r4os.r4dev.DriverContext) bool {
     if (!createIoCompletionQueue()) return false;
     if (!createIoSubmissionQueue()) return false;
     state.io_queue_configured = true;
+    state.machine.markReady();
     return registerNamespaceBlockDevices(ctx);
 }
 
@@ -407,7 +450,19 @@ fn registerNamespaceBlockDevices(ctx: *const r4os.r4dev.DriverContext) bool {
 
 fn testReadSectorZero(ns: *NamespaceRuntime) bool {
     var scratch: [NVME_SECTOR_SIZE]u8 = undefined;
-    return readBlock(ns, 0, 1, scratch[0..]);
+    const bytes = validateIoTransfer(ns, 0, 1, scratch.len) orelse return false;
+    const dma_bytes: [*]u8 = @ptrFromInt(dma.io.virt_addr);
+    @memset(dma_bytes[0..bytes], 0);
+    if (submitIoCommandOnce(.{
+        .nsid = ns.nsid,
+        .opcode = NVM_OP_READ,
+        .lba = 0,
+        .sectors = 1,
+        .prp1 = dma.io.phys_addr,
+    }) != .success) return false;
+    dmaFence();
+    @memcpy(scratch[0..bytes], dma_bytes[0..bytes]);
+    return true;
 }
 
 fn registerBlockDevice(ctx: *const r4os.r4dev.DriverContext, ns: *NamespaceRuntime, slot: usize) bool {
@@ -420,7 +475,7 @@ fn registerBlockDevice(ctx: *const r4os.r4dev.DriverContext, ns: *NamespaceRunti
         .sector_size = ns.sector_size,
         .max_sectors_per_request = MAX_IO_SECTORS,
         .queue_depth = state.io_queue_depth,
-        .timeout_ticks = 0,
+        .timeout_ticks = nvme_state.requestBudgetTicks(state.timer_hz, state.timeout_units),
         .sector_count = ns.sector_count,
         .context = ns,
         .read = storageRead,
@@ -472,12 +527,12 @@ fn storageShutdown(ctx: ?*anyopaque) callconv(.c) i32 {
 fn storageStatus(ctx: ?*anyopaque, out: *r4os.abi.StorageBackendStatus) callconv(.c) i32 {
     const ns = namespaceFromContext(ctx) orelse return -1;
     out.* = .{
-        .state = if (ns.usable) 1 else 0,
+        .state = if (ns.usable and state.machine.phase == .ready) 1 else 0,
         .last_error = state.last_error,
         .last_lba = state.last_lba,
         .last_sectors = state.last_sectors,
-        .recoveries = 0,
-        .recovery_failures = state.io_failures,
+        .recoveries = state.machine.recoveries,
+        .recovery_failures = state.machine.recovery_failures,
     };
     return 0;
 }
@@ -501,31 +556,54 @@ fn writeBlock(ns: *NamespaceRuntime, lba: u64, sectors: u16, data: []const u8) b
 }
 
 fn flushBlock(ns: *NamespaceRuntime) bool {
-    if (!state.io_queue_configured or !ns.usable) return failIo(50);
+    if (!state.io_queue_configured or !ns.usable or state.machine.phase != .ready) return failIo(50);
     return submitIoCommand(ns.nsid, NVM_OP_FLUSH, 0, 0, 0);
 }
 
 fn submitIoCommand(nsid: u32, opcode: u8, lba: u64, sectors: u16, prp1: u64) bool {
-    if (state.io_command_pending) return failIo(82);
+    const command = IoCommand{
+        .nsid = nsid,
+        .opcode = opcode,
+        .lba = lba,
+        .sectors = sectors,
+        .prp1 = prp1,
+    };
+    return switch (submitIoCommandOnce(command)) {
+        .success => true,
+        .timeout, .fatal => recoverIoAndReplay(command),
+        .command_failed, .invalid => false,
+    };
+}
+
+fn submitIoCommandOnce(command: IoCommand) WaitOutcome {
+    if (state.io_command_pending) {
+        _ = failIo(82);
+        return .invalid;
+    }
     const cid = allocateIoCid();
+    const ctx = context();
+    if (!state.machine.begin(.io, cid, ctx.tickCount(), nvme_state.ioTimeoutTicks(state.timer_hz))) {
+        _ = failIo(83);
+        return .invalid;
+    }
     const tail = state.io_sq_tail;
     const cmd = ioSqCommand(tail);
     @memset(cmd[0..ADMIN_COMMAND_DWORDS], 0);
-    cmd[0] = @as(u32, opcode) | (@as(u32, cid) << 16);
-    cmd[1] = nsid;
-    if (prp1 != 0) {
-        cmd[6] = @truncate(prp1);
-        cmd[7] = @truncate(prp1 >> 32);
+    cmd[0] = @as(u32, command.opcode) | (@as(u32, cid) << 16);
+    cmd[1] = command.nsid;
+    if (command.prp1 != 0) {
+        cmd[6] = @truncate(command.prp1);
+        cmd[7] = @truncate(command.prp1 >> 32);
     }
-    if (sectors != 0) {
-        cmd[10] = @truncate(lba);
-        cmd[11] = @truncate(lba >> 32);
-        cmd[12] = @as(u32, sectors - 1);
+    if (command.sectors != 0) {
+        cmd[10] = @truncate(command.lba);
+        cmd[11] = @truncate(command.lba >> 32);
+        cmd[12] = @as(u32, command.sectors - 1);
     }
 
     state.last_io_status = 0xFFFF;
-    state.last_lba = lba;
-    state.last_sectors = sectors;
+    state.last_lba = command.lba;
+    state.last_sectors = command.sectors;
     state.io_commands += 1;
     state.io_command_pending = true;
     state.io_sq_tail = nextQueueIndex(state.io_sq_tail, state.io_queue_depth);
@@ -536,7 +614,7 @@ fn submitIoCommand(nsid: u32, opcode: u8, lba: u64, sectors: u16, prp1: u64) boo
 }
 
 fn validateIoTransfer(ns: *const NamespaceRuntime, lba: u64, sectors: u16, buffer_len: usize) ?usize {
-    if (!state.io_queue_configured or !ns.usable) return failIoNull(60);
+    if (!state.io_queue_configured or !ns.usable or state.machine.phase != .ready) return failIoNull(60);
     if (sectors == 0 or sectors > MAX_IO_SECTORS) return failIoNull(61);
     const bytes = @as(usize, sectors) * NVME_SECTOR_SIZE;
     if (buffer_len < bytes) return failIoNull(62);
@@ -545,24 +623,49 @@ fn validateIoTransfer(ns: *const NamespaceRuntime, lba: u64, sectors: u16, buffe
     return bytes;
 }
 
-fn pollAdminCompletion(expected_cid: u16) bool {
-    var guard: u32 = 0;
-    while (guard < ADMIN_WAIT_GUARD) : (guard += 1) {
+fn pollAdminCompletion(expected_cid: u16) WaitOutcome {
+    const ctx = context();
+    while (true) {
         const dw3 = adminCqDword(state.admin_cq_head, 3);
-        if (completionPhase(dw3) != state.admin_cq_phase) continue;
-        state.last_admin_status = completionStatus(dw3);
-        state.admin_completions += 1;
-        advanceAdminCqHead();
-
-        if (completionCid(dw3) != expected_cid) return failAdmin(70);
-        state.admin_command_pending = false;
-        if (state.last_admin_status != 0) return failAdmin(71);
-        return true;
+        const visible = completionPhase(dw3) == state.admin_cq_phase;
+        const csts = read32(REG_CSTS);
+        state.csts = csts;
+        switch (nvme_state.pollDecision(
+            visible,
+            (csts & CSTS_CFS) != 0,
+            state.machine.expired(.admin, ctx.tickCount()),
+        )) {
+            .completion => {
+                state.last_admin_status = completionStatus(dw3);
+                state.admin_completions += 1;
+                advanceAdminCqHead();
+                const cid = completionCid(dw3);
+                if (state.machine.classify(.admin, cid) != .current or cid != expected_cid) {
+                    _ = failAdmin(70);
+                    continue;
+                }
+                _ = state.machine.complete(.admin, cid);
+                state.admin_command_pending = false;
+                if (state.last_admin_status != 0) {
+                    _ = failAdmin(71);
+                    return .command_failed;
+                }
+                state.last_error = 0;
+                return .success;
+            },
+            .fatal => {
+                _ = failAdmin(75);
+                return .fatal;
+            },
+            .timeout => {
+                state.admin_timeouts += 1;
+                state.last_admin_status = completionStatus(adminCqDword(state.admin_cq_head, 3));
+                _ = failAdmin(72);
+                return .timeout;
+            },
+            .wait => ctx.waitTicks(1),
+        }
     }
-
-    state.admin_timeouts += 1;
-    state.last_admin_status = completionStatus(adminCqDword(state.admin_cq_head, 3));
-    return failAdmin(72);
 }
 
 fn advanceAdminCqHead() void {
@@ -574,27 +677,49 @@ fn advanceAdminCqHead() void {
     write32(doorbellOffset(0, 1), state.admin_cq_head);
 }
 
-fn pollIoCompletion(expected_cid: u16) bool {
-    var guard: u32 = 0;
-    while (guard < IO_WAIT_GUARD) : (guard += 1) {
+fn pollIoCompletion(expected_cid: u16) WaitOutcome {
+    const ctx = context();
+    while (true) {
         const dw3 = ioCqDword(state.io_cq_head, 3);
-        if (completionPhase(dw3) != state.io_cq_phase) continue;
-        state.last_io_status = completionStatus(dw3);
-        state.io_completions += 1;
-        advanceIoCqHead();
-
-        if (completionCid(dw3) != expected_cid) {
-            state.io_cid_mismatches += 1;
-            continue;
+        const visible = completionPhase(dw3) == state.io_cq_phase;
+        const csts = read32(REG_CSTS);
+        state.csts = csts;
+        switch (nvme_state.pollDecision(
+            visible,
+            (csts & CSTS_CFS) != 0,
+            state.machine.expired(.io, ctx.tickCount()),
+        )) {
+            .completion => {
+                state.last_io_status = completionStatus(dw3);
+                state.io_completions += 1;
+                advanceIoCqHead();
+                const cid = completionCid(dw3);
+                if (state.machine.classify(.io, cid) != .current or cid != expected_cid) {
+                    state.io_cid_mismatches += 1;
+                    continue;
+                }
+                _ = state.machine.complete(.io, cid);
+                state.io_command_pending = false;
+                if (state.last_io_status != 0) {
+                    _ = failIo(80);
+                    return .command_failed;
+                }
+                state.last_error = 0;
+                return .success;
+            },
+            .fatal => {
+                _ = failIo(84);
+                return .fatal;
+            },
+            .timeout => {
+                state.io_timeouts += 1;
+                state.last_io_status = completionStatus(ioCqDword(state.io_cq_head, 3));
+                _ = failIo(81);
+                return .timeout;
+            },
+            .wait => ctx.waitTicks(1),
         }
-        state.io_command_pending = false;
-        if (state.last_io_status != 0) return failIo(80);
-        return true;
     }
-
-    state.io_timeouts += 1;
-    state.last_io_status = completionStatus(ioCqDword(state.io_cq_head, 3));
-    return failIo(81);
 }
 
 fn advanceIoCqHead() void {
@@ -606,6 +731,121 @@ fn advanceIoCqHead() void {
     write32(doorbellOffset(IO_QUEUE_ID, 1), state.io_cq_head);
 }
 
+fn recoverIoAndReplay(command: IoCommand) bool {
+    if (!state.machine.beginRecovery()) return failIo(85);
+
+    const ctx = context();
+    const ns = namespaceById(command.nsid);
+    const recovery_name = if (ns) |namespace| nameForNamespace(namespaceSlot(namespace)) else "nvme?";
+    const recovery_announced = ns != null and ns.?.block_registered and
+        ctx.storageBackendRecoveryBegin(recovery_name) == 0;
+
+    // Abort is best effort.  Irrespective of the Abort completion, the
+    // controller is disabled before queue memory or its generation changes.
+    if (state.machine.currentCid(.io)) |cid| {
+        const csts = read32(REG_CSTS);
+        if (state.controller_ready and !state.admin_command_pending and (csts & CSTS_CFS) == 0) {
+            const cdw10 = (@as(u32, cid) << 16) | @as(u32, IO_QUEUE_ID);
+            _ = submitAdminCommandOutcome(ADMIN_OP_ABORT, 0, 0, cdw10, 0);
+        }
+    }
+
+    if (!rebuildControllerQueues()) {
+        _ = haltFailedController();
+        state.machine.finishRecovery(false);
+        if (recovery_announced) _ = ctx.storageBackendRecoveryFinish(recovery_name, false);
+        return failIo(86);
+    }
+
+    const replay = submitIoCommandOnce(command);
+    switch (replay) {
+        .success => {
+            state.machine.finishRecovery(true);
+            if (recovery_announced) _ = ctx.storageBackendRecoveryFinish(recovery_name, true);
+            return true;
+        },
+        .command_failed => {
+            // The queue was recovered even though the replayed command itself
+            // returned an NVMe status error.
+            state.machine.finishRecovery(true);
+            if (recovery_announced) _ = ctx.storageBackendRecoveryFinish(recovery_name, true);
+            return false;
+        },
+        .timeout, .fatal, .invalid => {
+            // Never reuse payload or queue DMA after a failed replay.  A final
+            // finite halt leaves the backend unambiguously failed.
+            _ = haltFailedController();
+            state.machine.finishRecovery(false);
+            if (recovery_announced) _ = ctx.storageBackendRecoveryFinish(recovery_name, false);
+            return failIo(87);
+        },
+    }
+}
+
+fn rebuildControllerQueues() bool {
+    if (!disableController()) return false;
+
+    state.machine.resetQueues();
+    resetQueueSoftwareState();
+    zeroQueueMemory();
+    configureAdminQueues();
+    if (!enableController()) return false;
+    if (!createIoCompletionQueue()) return false;
+    if (!createIoSubmissionQueue()) return false;
+    state.io_queue_configured = true;
+    return true;
+}
+
+fn haltFailedController() bool {
+    const stopped = if (state.mapped) disableController() else true;
+    if (stopped) {
+        state.machine.resetQueues();
+        resetQueueSoftwareState();
+        state.admin_queue_configured = false;
+    }
+    state.io_queue_configured = false;
+    state.io_sq_created = false;
+    state.io_cq_created = false;
+    state.namespace_usable = false;
+    for (&namespaces) |*ns| ns.usable = false;
+    return stopped;
+}
+
+fn resetQueueSoftwareState() void {
+    state.admin_command_pending = false;
+    state.io_command_pending = false;
+    state.admin_sq_tail = 0;
+    state.admin_cq_head = 0;
+    state.admin_cq_phase = 1;
+    state.io_sq_tail = 0;
+    state.io_cq_head = 0;
+    state.io_cq_phase = 1;
+    state.io_sq_created = false;
+    state.io_cq_created = false;
+    state.io_queue_configured = false;
+}
+
+fn zeroQueueMemory() void {
+    if (dma.asq.virt_addr != 0) zeroPage(dma.asq.virt_addr);
+    if (dma.acq.virt_addr != 0) zeroPage(dma.acq.virt_addr);
+    if (dma.iosq.virt_addr != 0) zeroPage(dma.iosq.virt_addr);
+    if (dma.iocq.virt_addr != 0) zeroPage(dma.iocq.virt_addr);
+}
+
+fn namespaceById(nsid: u32) ?*NamespaceRuntime {
+    for (&namespaces) |*ns| {
+        if (ns.nsid == nsid) return ns;
+    }
+    return null;
+}
+
+fn namespaceSlot(target: *const NamespaceRuntime) usize {
+    for (&namespaces, 0..) |*ns, slot| {
+        if (ns == target) return slot;
+    }
+    return namespaces.len;
+}
+
 fn readControllerRegisters() void {
     state.cap = read64(REG_CAP);
     state.vs = read32(REG_VS);
@@ -614,6 +854,8 @@ fn readControllerRegisters() void {
     state.aqa = read32(REG_AQA);
     state.asq = read64(REG_ASQ);
     state.acq = read64(REG_ACQ);
+
+    state.timeout_units = @truncate((state.cap >> 24) & 0xFF);
 
     const dstrd: u5 = @truncate((state.cap >> 32) & 0xF);
     state.doorbell_stride = @as(u32, 4) << dstrd;
@@ -655,16 +897,21 @@ fn parseIdentifyNamespace(ns: *NamespaceRuntime) void {
 }
 
 fn waitReady(want_ready: bool) bool {
-    var guard: u32 = 0;
-    while (guard < ADMIN_WAIT_GUARD) : (guard += 1) {
+    const ctx = context();
+    const start = ctx.tickCount();
+    const timeout = nvme_state.controllerTimeoutTicks(state.timer_hz, state.timeout_units);
+    while (true) {
         const csts = read32(REG_CSTS);
         state.csts = csts;
         const ready = (csts & CSTS_RDY) != 0;
         if (ready == want_ready) return true;
         if (want_ready and (csts & CSTS_CFS) != 0) return false;
+        if (nvme_state.deadlineExpired(start, timeout, ctx.tickCount())) {
+            state.admin_timeouts += 1;
+            return false;
+        }
+        ctx.waitTicks(1);
     }
-    state.admin_timeouts += 1;
-    return false;
 }
 
 fn shutdownController(ctx: *const r4os.r4dev.DriverContext) bool {
@@ -705,13 +952,12 @@ fn shutdownController(ctx: *const r4os.r4dev.DriverContext) bool {
     if (state.mapped) {
         controller_stopped = disableController();
         if (controller_stopped) {
+            state.machine.resetQueues();
+            resetQueueSoftwareState();
             write32(REG_AQA, 0);
             write64(REG_ASQ, 0);
             write64(REG_ACQ, 0);
             state.admin_queue_configured = false;
-            state.io_queue_configured = false;
-            state.io_sq_created = false;
-            state.io_cq_created = false;
         }
     }
     const bus_master_disabled = disablePciBusMaster(ctx);
@@ -721,6 +967,7 @@ fn shutdownController(ctx: *const r4os.r4dev.DriverContext) bool {
         state.present = false;
         state.namespace_usable = false;
         for (&namespaces) |*ns| ns.usable = false;
+        state.machine.markStopped();
     }
     if (!graceful) ctx.logWarn("NVME.R4D graceful queue shutdown incomplete; controller halt used");
     state.shutdown_safe = safe;
@@ -769,6 +1016,10 @@ fn failIo(error_code: u32) bool {
 fn failIoNull(error_code: u32) ?usize {
     _ = failIo(error_code);
     return null;
+}
+
+fn context() r4os.r4dev.DriverContext {
+    return r4os.r4dev.DriverContext.init(state.api.?);
 }
 
 fn namespaceFromContext(ctx: ?*anyopaque) ?*NamespaceRuntime {

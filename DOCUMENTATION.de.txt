@@ -12,9 +12,25 @@ Bus Mastering nachweislich abgeschaltet wurde. Offene oder zeitueberschrittene
 Commands fuehren deshalb nicht zu Use-after-free: bei fehlendem Haltbeweis
 bleiben die Seiten fuer einen spaeteren Retry quarantainisiert.
 
-Auch partielle Initialisierung und der Legacy-Rescue-Fallback benutzen diesen
-Abbau. Storage-Backend-Finalizer liefern das gecachte sichere Ergebnis und
-greifen nach dem Top-Level-Shutdown nicht erneut auf DMA-Queues zu.
+Auch partielle Initialisierung benutzt diesen Abbau. Storage-Backend-Finalizer
+liefern das gecachte sichere Ergebnis und greifen nach dem Top-Level-Shutdown
+nicht erneut auf DMA-Queues zu.
+
+Zeitgrenzen und Recovery seit 0.69.20
+-------------------------------------
+
+NVME.R4D ist der einzige NVMe-Controllerbesitzer; der vorherige zweite
+Kernel-Rescuecontroller wurde entfernt. CAP.TO begrenzt CC.EN-Uebergaenge in
+monotonen Timerticks. Admin- und I/O-Kommandos besitzen getrennte finite
+Deadlines und beenden ihren Wait unmittelbar bei CSTS.CFS.
+
+Nach einem I/O-Timeout oder Fatal Status versucht der Treiber genau einen
+Admin-Abort. Danach wird der Controller angehalten, die Queuegeneration
+gewechselt, beide Queues werden aus geleertem DMA-Zustand neu aufgebaut und
+das urspruengliche Kommando wird hoechstens einmal wiederholt. Ein weiterer
+Timeout haelt den Controller mit endlicher Deadline an und markiert das
+Backend eindeutig als ausgefallen. Erst CSTS.RDY=0 erlaubt Queue- oder
+Payloadspeicher wiederzuverwenden.
 
 Projektstruktur seit 0.51.22
 --------------------------------

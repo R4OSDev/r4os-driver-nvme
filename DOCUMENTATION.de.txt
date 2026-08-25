@@ -1,53 +1,73 @@
 ﻿NVME.R4D
 ========
 
-Lebenszyklus seit 0.69.17
+Paralleler Datenpfad seit 0.69.40
+---------------------------------
+
+NVME.R4D ist der einzige NVMe-Controllerbesitzer und der erste reale
+Hardwareverbraucher des asynchronen StorageBackend-v2-Vertrags. Der Treiber
+setzt die PCI-Suche nach jedem Treffer fort, verarbeitet die fortsetzbare
+Active-Namespace-Liste und lehnt ein ueber der festen Plattformkapazitaet
+liegendes Inventar explizit ab, statt Controller oder Namespaces still zu
+verlieren. Nur aktive Namespaces ohne Metadaten und mit 512, 1024, 2048 oder
+4096 Byte grossen logischen Sektoren werden als Blockbackend registriert.
+
+CAP.MQES begrenzt Admin- und I/O-Ringe einschliesslich des reservierten
+Full/Empty-Eintrags. Set Features/Number of Queues handelt die nutzbaren
+SQ-/CQ-Paare aus; eine abgelehnte Aushandlung bleibt als einzelnes Queuepaar
+funktionsfaehig. Namespaces werden stabil auf die vorhandenen Queuepaare
+verteilt. Queue-Tiefe eins ist ein vollwertiger Sicherheitsfallback.
+
+Der Laufzeitpfad besitzt mehrere generationengebundene Slots und eindeutige
+CIDs. Segmentierte Streaming-DMA-Abbildungen werden in PRP1/PRP2 oder eine
+einzelne begrenzte PRP-Listenseite uebersetzt. Die Transfergrenze ist das
+Minimum aus MDTS, der auditierten 2-MB-Grenze und der Namespacegeometrie.
+Mehrere SQ-Eintraege werden vor einer Tail-Doorbell veroeffentlicht; eine
+Completionrunde leert alle sichtbaren Phasebit-Eintraege und bestaetigt den
+neuen CQ-Head nur einmal. Completion-CID, Controller-, Namespace-, Queue- und
+Slotgeneration verhindern eine Zuordnung zu wiederverwendetem Besitz.
+
+Vor dem Scheduler benutzt der Blockscan die synchronen v1-Callbacks ueber
+dieselben DMA-, Queue- und Completionpfade. Sobald der Blockworker laeuft,
+wechselt derselbe Backenddeskriptor auf nichtblockierendes Submit. Der
+begrenzte Poll-/Deferred-Work-Pfad bleibt auch ohne MSI-X oder bei fehlender
+Workqueuekapazitaet korrekt.
+
+Zeitgrenzen, Recovery und Lebenszyklus
+--------------------------------------
+
+CAP.TO begrenzt CC.EN-Uebergaenge in monotonen Timerticks. Admin- und
+I/O-Kommandos besitzen getrennte finite Deadlines und reagieren unmittelbar
+auf CSTS.CFS. Timeout oder Cancel versuchen fuer ein aktives Kommando einen
+Admin-Abort. Reicht das nicht, stoppt der Treiber den Controller, projiziert
+jedes akzeptierte Kommando genau einmal als Timeout, Cancel oder Reset,
+wechselt alle Besitzgenerationen und baut Admin- sowie I/O-Queues neu auf.
+Das aktive Namespaceinventar und seine Geometrie muessen danach exakt zum
+registrierten Bestand passen; andernfalls bleibt das Backend fehlgeschlagen.
+
+Der Shutdown schliesst zuerst neue Storage-Aufrufe. Nach dem vom Blocklayer
+bewiesenen Stillstand versucht er fuer alle registrierten Namespaces einen
+begrenzten Flush sowie die geordnete Loeschung von SQ vor CQ. Unabhaengig von
+diesen Komfortschritten ist CC.EN=0 mit beobachtetem CSTS.RDY=0 die harte
+DMA-Sicherheitsgrenze. DMA wird erst danach und nach nachweislich deaktiviertem
+PCI Bus Mastering freigegeben. Scheitert dieser Beweis, bleiben Controller,
+Queues und Payloadabbildungen fuer einen spaeteren Retry quarantainisiert.
+Auch partielle Initialisierung benutzt denselben Abbau.
+
+Projektstruktur und Build
 -------------------------
 
-Der Shutdown schliesst zuerst neue Storage-Aufrufe, versucht alle nutzbaren
-Namespaces zu flushen und loescht die I/O Submission- und Completion-Queue.
-Unabhaengig vom Ergebnis dieser Komfortschritte wird der Controller ueber
-CC.EN=0 angehalten. DMA wird nur freigegeben, wenn CSTS.RDY=0 gelesen und PCI
-Bus Mastering nachweislich abgeschaltet wurde. Offene oder zeitueberschrittene
-Commands fuehren deshalb nicht zu Use-after-free: bei fehlendem Haltbeweis
-bleiben die Seiten fuer einen spaeteren Retry quarantainisiert.
+Dieses Verzeichnis ist das eigenstaendige R4OS-SDK-Projekt
+`Repositories/Drivers/NVME`.
 
-Auch partielle Initialisierung benutzt diesen Abbau. Storage-Backend-Finalizer
-liefern das gecachte sichere Ergebnis und greifen nach dem Top-Level-Shutdown
-nicht erneut auf DMA-Queues zu.
+Unter Windows:
 
-Zeitgrenzen und Recovery seit 0.69.20
--------------------------------------
+    Build.bat test
 
-NVME.R4D ist der einzige NVMe-Controllerbesitzer; der vorherige zweite
-Kernel-Rescuecontroller wurde entfernt. CAP.TO begrenzt CC.EN-Uebergaenge in
-monotonen Timerticks. Admin- und I/O-Kommandos besitzen getrennte finite
-Deadlines und beenden ihren Wait unmittelbar bei CSTS.CFS.
+Unter Linux:
 
-Nach einem I/O-Timeout oder Fatal Status versucht der Treiber genau einen
-Admin-Abort. Danach wird der Controller angehalten, die Queuegeneration
-gewechselt, beide Queues werden aus geleertem DMA-Zustand neu aufgebaut und
-das urspruengliche Kommando wird hoechstens einmal wiederholt. Ein weiterer
-Timeout haelt den Controller mit endlicher Deadline an und markiert das
-Backend eindeutig als ausgefallen. Erst CSTS.RDY=0 erlaubt Queue- oder
-Payloadspeicher wiederzuverwenden.
+    ./Build.sh test
 
-Projektstruktur seit 0.51.22
---------------------------------
-
-Dieses Verzeichnis ist ein eigenstaendiges R4OS-SDK-Projekt fuer NVME.R4D.
-
-Build:
-
-    cd Code\System\Driver\NVME
-    ..\..\..\DevTools\Zig\zig.exe build
-
-Artefakt:
-
-    zig-out\NVME.R4D
-
-Manifest:
-
-    module.R4MF
-
-Image-Zielpfad: C:\R4OS\DRIVERS\NVME.R4D
+Das Artefakt entsteht als `zig-out/NVME.R4D`; `module.R4MF` ist die kanonische
+Build-, Versions- und Imagequelle. Das Imageziel lautet
+`/R4OS/DRIVERS/NVME.R4D`.

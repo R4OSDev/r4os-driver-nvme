@@ -229,6 +229,26 @@ pub fn transferSectors(byte_limit: u32, sector_size: u32) u16 {
     return @intCast(@min(@as(u64, byte_limit / sector_size), std.math.maxInt(u16)));
 }
 
+/// A synchronous read is safe to issue once more only when its first attempt
+/// forced a transport recovery that completed successfully.  Command-status,
+/// validation and DMA-preparation failures do not advance the recovery
+/// generation and therefore remain terminal for the caller.
+pub fn replayRecoveredRead(recoveries_before: u64, recoveries_after: u64, controller_ready: bool) bool {
+    return controller_ready and recoveries_after > recoveries_before;
+}
+
+/// Preserve a failed NVM completion in the compact public backend status.
+/// 0x8OOOPSSS means: I/O completion, 12-bit PRP1 page offset OOO, PRP2
+/// present flag P, and the controller's unmodified 15-bit status SSS.
+pub fn ioCompletionError(status: u16, prp1: u64, has_prp2: bool) u32 {
+    if (status == 0) return 0;
+    const prp_offset: u32 = @intCast(prp1 & 0xFFF);
+    return 0x8000_0000 |
+        (prp_offset << 16) |
+        (if (has_prp2) @as(u32, 1 << 15) else 0) |
+        @as(u32, status & 0x7FFF);
+}
+
 pub fn deadlineExpired(start_tick: u64, timeout_ticks: u64, now: u64) bool {
     return timeout_ticks != 0 and now -% start_tick >= timeout_ticks;
 }
@@ -376,6 +396,18 @@ test "MDTS and sector size bound larger transfers" {
     try std.testing.expectEqual(@as(u32, 32 * 1024), mdtsBytes(3, 0, 2 * 1024 * 1024));
     try std.testing.expectEqual(@as(u16, 64), transferSectors(32 * 1024, 512));
     try std.testing.expectEqual(@as(u16, 8), transferSectors(32 * 1024, 4096));
+}
+
+test "boot read replay requires a completed transport recovery" {
+    try std.testing.expect(replayRecoveredRead(3, 4, true));
+    try std.testing.expect(!replayRecoveredRead(3, 3, true));
+    try std.testing.expect(!replayRecoveredRead(3, 4, false));
+}
+
+test "I/O completion diagnostics retain status PRP offset and PRP2 presence" {
+    try std.testing.expectEqual(@as(u32, 0), ioCompletionError(0, 0x123, true));
+    try std.testing.expectEqual(@as(u32, 0x8123_8004), ioCompletionError(4, 0xABC0_0123, true));
+    try std.testing.expectEqual(@as(u32, 0x8FFF_7FFF), ioCompletionError(0xFFFF, 0xFFFF, false));
 }
 
 test "timeouts remain monotone across tick wrap and visible completion wins" {

@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.4`
+- Version: `0.1.5`
 - Image target: `/R4OS/DRIVERS/NVME.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -23,6 +23,13 @@ doorbells, and batched CQ drainage. The finite polling/deferred-work path is
 also the safe fallback when interrupts or extra queue pairs are unavailable.
 Pre-scheduler block scans use the same queues through the synchronous version-1
 callbacks and switch to nonblocking submission when the block worker is live.
+If such an idempotent boot read causes a transport timeout or fatal recovery,
+the successfully rebuilt controller replays that read exactly once. Command,
+validation, media, and DMA-preparation errors are not retried.
+The backend status retains a rejected I/O completion as `0x8OOOPSSS`: `OOO`
+is the PRP1 page offset, `P` indicates PRP2, and `SSS` is the unchanged NVMe
+completion status. This keeps early hardware failures observable without
+turning a command error into a transport retry.
 
 CAP.TO-derived monotonic deadlines bound controller transitions; Admin and I/O
 completions have separate finite deadlines. Timeout and cancellation run

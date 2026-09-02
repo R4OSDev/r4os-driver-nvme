@@ -33,6 +33,18 @@ wechselt derselbe Backenddeskriptor auf nichtblockierendes Submit. Der
 begrenzte Poll-/Deferred-Work-Pfad bleibt auch ohne MSI-X oder bei fehlender
 Workqueuekapazitaet korrekt.
 
+Ein synchroner, idempotenter Read wird nach einer nachweislich erfolgreichen
+Transport-Recovery genau einmal erneut ausgegeben. Damit kann der fruehe
+Blockscan nach einem verlorenen Completion-Ereignis auf dem neu aufgebauten
+Queuepaar fortfahren. Reine Kommando-, Medien-, Validierungs- oder
+DMA-Vorbereitungsfehler loesen keinen Replay aus; Writes werden nicht
+automatisch wiederholt.
+
+Ein abgewiesener I/O-Completionstatus bleibt im Backendstatus als
+`0x8OOOPSSS` erhalten. `OOO` ist der Seitenoffset von PRP1, `P` markiert ein
+gesetztes PRP2 und `SSS` enthaelt den unveraenderten 15-Bit-NVMe-Status. So
+bleibt ein frueher Hardwarefehler ohne seriellen Diagnoseweg auswertbar.
+
 Zeitgrenzen, Recovery und Lebenszyklus
 --------------------------------------
 

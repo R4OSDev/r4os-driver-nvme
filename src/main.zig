@@ -223,6 +223,7 @@ const ControllerState = struct {
     io_completions: u64 = 0,
     io_failures: u64 = 0,
     io_timeouts: u64 = 0,
+    read_replays: u64 = 0,
     aborts: u64 = 0,
     recoveries: u64 = 0,
     recovery_failures: u64 = 0,
@@ -749,6 +750,18 @@ fn setControllerName(out: *[32]u8, index: u8) void {
 fn storageRead(raw: ?*anyopaque, lba: u64, sectors: u32, out: [*]u8, len: u32) callconv(.c) i32 {
     const namespace = namespaceFromContext(raw) orelse return -1;
     if (sectors == 0 or sectors > std.math.maxInt(u16)) return -2;
+    const controller = controllerForNamespace(namespace) orelse return -1;
+    const recoveries_before = controller.recoveries;
+    const first = syncIo(namespace, r4os.abi.storage_request_op_read, lba, @intCast(sectors), @intFromPtr(out), len, false);
+    if (first == 0) return 0;
+
+    // Early boot uses this synchronous callback before the block worker is
+    // available.  Recovery deliberately completes the timed-out command
+    // before rebuilding its queues; replay the idempotent read exactly once
+    // after that rebuild instead of turning a recovered transport incident
+    // into a permanently failed boot device.
+    if (!nvme_state.replayRecoveredRead(recoveries_before, controller.recoveries, controller.phase == .ready)) return first;
+    controller.read_replays +%= 1;
     return syncIo(namespace, r4os.abi.storage_request_op_read, lba, @intCast(sectors), @intFromPtr(out), len, false);
 }
 
@@ -1175,6 +1188,7 @@ fn drainQueueCompletions(controller: *ControllerState, queue_index: usize) void 
         };
         const slot = &queue.slots[slot_index];
         var result: i32 = if (status == 0) r4os.abi.storage_request_result_ok else r4os.abi.storage_request_result_error;
+        if (status != 0) controller.last_error = nvme_state.ioCompletionError(status, slot.prp1, slot.prp2 != 0);
         if (slot.cancel_reason != 0) result = cancelResult(slot.cancel_reason);
         if (slot.controller_generation != controller.generation or
             slot.namespace_slot >= controller.namespace_count or

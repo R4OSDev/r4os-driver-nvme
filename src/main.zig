@@ -8,6 +8,8 @@ const PROGIF_NVME: u8 = 0x02;
 
 const REG_CAP: u64 = 0x00;
 const REG_VS: u64 = 0x08;
+const REG_INTMS: u64 = 0x0C;
+const REG_INTMC: u64 = 0x10;
 const REG_CC: u64 = 0x14;
 const REG_CSTS: u64 = 0x1C;
 const REG_AQA: u64 = 0x24;
@@ -29,6 +31,18 @@ const MAX_TRANSFER_BYTES: u32 = 2 * 1024 * 1024;
 const ADMIN_REGION_PAGES: u32 = 4;
 const IO_REGION_PAGES: u32 = 2 + MAX_QUEUE_REQUESTS;
 const WORK_HANDLE_COUNT: usize = 3;
+const IO_INTERRUPT_VECTOR: u16 = 0;
+const IO_INTERRUPT_MASK: u32 = 1 << IO_INTERRUPT_VECTOR;
+const STATUS_READY: u32 = 1 << 0;
+const STATUS_IRQ_REGISTERED: u32 = 1 << 8;
+const STATUS_IRQ_ARMED: u32 = 1 << 9;
+const STATUS_IRQ_SEEN: u32 = 1 << 10;
+const STATUS_IRQ_WORK_SEEN: u32 = 1 << 11;
+const STATUS_IRQ_COMPLETION_SEEN: u32 = 1 << 12;
+const STATUS_POLL_FALLBACK_SEEN: u32 = 1 << 13;
+const STATUS_IRQ_WORK_DROPPED: u32 = 1 << 14;
+const STATUS_TIMEOUT_FALLBACK_SEEN: u32 = 1 << 15;
+const STATUS_MSIX_ACTIVE: u32 = 1 << 16;
 
 const COMMAND_DWORDS: usize = 16;
 const COMPLETION_BYTES: u64 = 16;
@@ -77,6 +91,12 @@ const ControllerPhase = enum(u8) {
     recovering,
     failed,
     stopped,
+};
+
+const MsixMaskPreparation = enum(u8) {
+    not_needed,
+    ready,
+    failed,
 };
 
 const SlotState = enum(u8) {
@@ -188,6 +208,28 @@ const ControllerState = struct {
     shutdown_safe: bool = false,
     inventory_complete: bool = true,
 
+    // PCI interrupt routing is configured lazily at the first runtime v2
+    // request, after the polled preload and Driver Work initialization.
+    msi_enabled: bool = false,
+    irq_registered: bool = false,
+    interrupt_setup_attempted: bool = false,
+    interrupts_armed: bool = false,
+    irq_route: u8 = 0xFF,
+    msix_table_virt: u64 = 0,
+    irq_generation: u64 = 0,
+    irq_generation_handled: u64 = 0,
+    irq_count: u64 = 0,
+    irq_work_wakeups: u64 = 0,
+    irq_work_submitted: u64 = 0,
+    irq_work_dropped: u64 = 0,
+    irq_completion_records: u64 = 0,
+    event_work_passes: u64 = 0,
+    polling_fallbacks: u64 = 0,
+    timeout_fallbacks: u64 = 0,
+    interrupt_masks: u64 = 0,
+    interrupt_unmasks: u64 = 0,
+    irq_probe_logged: bool = false,
+
     admin_region: r4os.abi.DmaBuffer = .{},
     admin_depth: u16 = 0,
     admin_sq_tail: u16 = 0,
@@ -208,6 +250,7 @@ const ControllerState = struct {
     next_sequence: u64 = 0,
 
     work_pending: bool = false,
+    work_active: bool = false,
     work_handles: [WORK_HANDLE_COUNT]u32 = .{0} ** WORK_HANDLE_COUNT,
     sync_busy: bool = false,
     sync_done: bool = false,
@@ -363,11 +406,16 @@ fn initializeController(controller: *ControllerState, ctx: *const r4os.r4dev.Dri
         controller.inventory_complete = false;
         return failController(controller, 12);
     }
-    if (!initializeIoQueues(controller, ctx)) return failController(controller, 13);
+    // Runtime interrupt routing is intentionally deferred until the first
+    // asynchronous request. MSI-X masking lives in the PCI table rather than
+    // INTMS, so enabling MSI-X during the polled boot scan could otherwise
+    // publish a completion before Driver Work is available.
+    maskRuntimeInterrupts(controller);
+    if (!initializeIoQueues(controller, ctx)) return failController(controller, 14);
     assignNamespacesToQueues(controller);
     if (!registerNamespaceBackends(controller, ctx)) {
         controller.inventory_complete = false;
-        return failController(controller, 14);
+        return failController(controller, 15);
     }
     controller.phase = .ready;
     @atomicStore(bool, &controller.accepting, true, .release);
@@ -405,6 +453,152 @@ fn configureAdminQueue(controller: *ControllerState) void {
     controller.admin_sq_tail = 0;
     controller.admin_cq = .{};
     controller.admin_pending = false;
+}
+
+fn setupInterrupts(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext) bool {
+    maskRuntimeInterrupts(controller);
+    controller.msi_enabled = false;
+    controller.irq_registered = false;
+    controller.interrupts_armed = false;
+    controller.irq_route = 0xFF;
+    controller.msix_table_virt = 0;
+
+    const msix_mask = prepareMsixVectorMask(controller, ctx);
+    if (msix_mask == .failed) {
+        ctx.logWarn("NVME.R4D MSI-X table unavailable; bounded polling fallback active");
+        return true;
+    }
+
+    const msi_irq = ctx.pciEnableMsi(controller.info);
+    if (msi_irq < 0) {
+        controller.msix_table_virt = 0;
+        ctx.logWarn("NVME.R4D MSI unavailable; bounded polling fallback active");
+        return true;
+    }
+    controller.msi_enabled = true;
+    // Keep the driver-visible table mapping masked as well. The common PCI
+    // layer retains the same state until irqRegister has published its
+    // handler; no submission is published before both owners agree.
+    if (msix_mask == .ready) setMsixVectorMask(controller, true);
+    if (msi_irq < 32) {
+        const route: u8 = @intCast(msi_irq);
+        if (ctx.irqRegister(route, irqHandler, @intFromPtr(controller), r4os.abi.irq_flag_msi) == 0) {
+            controller.irq_route = route;
+            controller.irq_registered = true;
+            ctx.logInfo("NVME.R4D MSI registered; runtime vector masked");
+            return true;
+        }
+    }
+
+    // Enabling MSI changes PCI interrupt delivery.  Falling back is safe only
+    // after restoring that capability to its disabled state.
+    if (ctx.pciDisableMsi(controller.info) != 0) {
+        // Both INTMS and a discovered MSI-X table entry remain masked. Keep
+        // the allocation for shutdown cleanup, but use bounded polling rather
+        // than accepting an unowned interrupt source.
+        ctx.logError("NVME.R4D MSI rollback failed; masked polling fallback active");
+        return true;
+    }
+    controller.msi_enabled = false;
+    controller.msix_table_virt = 0;
+    ctx.logWarn("NVME.R4D MSI registration failed; bounded polling fallback active");
+    return true;
+}
+
+fn prepareMsixVectorMask(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext) MsixMaskPreparation {
+    const status_command = ctx.pciReadConfig32(controller.info, 0x04);
+    if (status_command == 0xFFFF_FFFF or (status_command & (@as(u32, 1) << 20)) == 0) return .not_needed;
+
+    var offset: u16 = @as(u16, @as(u8, @truncate(ctx.pciReadConfig32(controller.info, 0x34)))) & 0xFC;
+    var msix_cap: u16 = 0;
+    var visited: u64 = 0;
+    var steps: u8 = 0;
+    while (offset >= 0x40 and offset <= 0xFC and steps < 48) : (steps += 1) {
+        const index: u6 = @intCast((offset - 0x40) / 4);
+        const bit = @as(u64, 1) << index;
+        if ((visited & bit) != 0) return .failed;
+        visited |= bit;
+        const header = ctx.pciReadConfig32(controller.info, offset);
+        if (header == 0xFFFF_FFFF) return .failed;
+        const capability_id: u8 = @truncate(header);
+        // The kernel deliberately prefers conventional MSI when both exist;
+        // INTMS/INTMC is sufficient for that delivery mode.
+        if (capability_id == 0x05) return .not_needed;
+        if (capability_id == 0x11 and msix_cap == 0) msix_cap = offset;
+        const next = @as(u16, @as(u8, @truncate(header >> 8))) & 0xFC;
+        if (next == 0 or next == offset) break;
+        offset = next;
+    }
+    if (msix_cap == 0) return .not_needed;
+
+    const descriptor = ctx.pciReadConfig32(controller.info, msix_cap + 0x04);
+    if (descriptor == 0xFFFF_FFFF) return .failed;
+    const bir: u8 = @truncate(descriptor & 0x7);
+    if (bir >= 6) return .failed;
+    const table_offset = descriptor & 0xFFFF_FFF8;
+    const required = @as(u64, table_offset) + 16;
+    if (required > MAX_MMIO_BYTES or required > std.math.maxInt(u32)) return .failed;
+    var region: r4os.abi.MmioRegion = .{};
+    if (ctx.pciMapBar(controller.info, bir, @intCast(required), 0, &region) != 0 or region.virt_addr == 0) return .failed;
+    controller.msix_table_virt = region.virt_addr + table_offset;
+    return .ready;
+}
+
+fn setMsixVectorMask(controller: *ControllerState, masked: bool) void {
+    if (controller.msix_table_virt == 0) return;
+    const vector_control: *volatile u32 = @ptrFromInt(controller.msix_table_virt + 12);
+    if (masked) {
+        vector_control.* |= 1;
+    } else {
+        vector_control.* &= ~@as(u32, 1);
+    }
+    asm volatile ("mfence" ::: .{ .memory = true });
+}
+
+fn armRuntimeInterrupts(controller: *ControllerState) bool {
+    if (@atomicLoad(bool, &controller.interrupts_armed, .acquire)) return true;
+    if (!acquireController(controller)) return false;
+    defer releaseController(controller);
+    if (!controller.interrupt_setup_attempted) {
+        controller.interrupt_setup_attempted = true;
+        const ctx = controllerContext(controller);
+        if (!setupInterrupts(controller, &ctx)) {
+            controller.phase = .failed;
+            @atomicStore(bool, &controller.accepting, false, .release);
+            return false;
+        }
+    }
+    if (!controller.irq_registered) return false;
+    if (!controller.interrupts_armed and controller.phase == .ready and
+        !controller.recovering and !controller.shutting_down)
+    {
+        // The CQ was created interrupt-capable on IV=0 during preload, while
+        // the PCI message route stayed disabled. It is now safe to expose MSI
+        // or the mapped MSI-X entry to the scheduler and Driver Work.
+        @atomicStore(bool, &controller.interrupts_armed, true, .release);
+        unmaskRuntimeInterrupts(controller);
+    }
+    return controller.interrupts_armed;
+}
+
+fn maskRuntimeInterrupts(controller: *ControllerState) void {
+    if (!controller.mapped) return;
+    setMsixVectorMask(controller, true);
+    write32(controller, REG_INTMS, IO_INTERRUPT_MASK);
+    _ = @atomicRmw(u64, &controller.interrupt_masks, .Add, 1, .acq_rel);
+}
+
+fn unmaskRuntimeInterrupts(controller: *ControllerState) void {
+    if (!controller.mapped or !nvme_state.runtimeInterruptAllowed(
+        controller.irq_registered,
+        @atomicLoad(bool, &controller.interrupts_armed, .acquire),
+        @atomicLoad(bool, &controller.accepting, .acquire),
+        @atomicLoad(bool, &controller.recovering, .acquire),
+        @atomicLoad(bool, &controller.shutting_down, .acquire),
+    )) return;
+    write32(controller, REG_INTMC, IO_INTERRUPT_MASK);
+    setMsixVectorMask(controller, false);
+    _ = @atomicRmw(u64, &controller.interrupt_unmasks, .Add, 1, .acq_rel);
 }
 
 fn identifyController(controller: *ControllerState) bool {
@@ -670,9 +864,12 @@ fn initializeIoQueues(controller: *ControllerState, ctx: *const r4os.r4dev.Drive
 fn createIoCompletionQueue(controller: *ControllerState, queue: *IoQueue) bool {
     const size_zero_based = @as(u32, queue.depth - 1);
     const cdw10 = @as(u32, queue.qid) | (size_zero_based << 16);
-    // PC=1, IEN=0: preload happens before the platform interrupt handoff, so
-    // the correct baseline is the bounded poll/deferred-work path.
-    const result = submitAdminCommand(controller, ADMIN_OP_CREATE_IO_CQ, 0, ioCqPhys(queue), 0, cdw10, 1);
+    // The queue is interrupt-capable from creation, while the PCI message
+    // route itself remains disabled throughout the synchronous preload. It is
+    // installed immediately before the first asynchronous submission is
+    // published, which also works for MSI-X where INTMS is not the mask.
+    const cdw11 = nvme_state.ioCompletionQueueControl(true, IO_INTERRUPT_VECTOR);
+    const result = submitAdminCommand(controller, ADMIN_OP_CREATE_IO_CQ, 0, ioCqPhys(queue), 0, cdw10, cdw11);
     return result.outcome == .success;
 }
 
@@ -786,9 +983,20 @@ fn storageShutdown(raw: ?*anyopaque) callconv(.c) i32 {
 fn storageStatus(raw: ?*anyopaque, out: *r4os.abi.StorageBackendStatus) callconv(.c) i32 {
     const namespace = namespaceFromContext(raw) orelse return -1;
     const controller = controllerForNamespace(namespace) orelse return -1;
+    var state: u32 = 0;
+    if (namespace.identity.usable and controller.phase == .ready and
+        !@atomicLoad(bool, &controller.shutting_down, .acquire)) state |= STATUS_READY;
+    if (controller.irq_registered) state |= STATUS_IRQ_REGISTERED;
+    if (@atomicLoad(bool, &controller.interrupts_armed, .acquire)) state |= STATUS_IRQ_ARMED;
+    if (@atomicLoad(u64, &controller.irq_count, .acquire) != 0) state |= STATUS_IRQ_SEEN;
+    if (@atomicLoad(u64, &controller.irq_work_wakeups, .acquire) != 0) state |= STATUS_IRQ_WORK_SEEN;
+    if (@atomicLoad(u64, &controller.irq_completion_records, .acquire) != 0) state |= STATUS_IRQ_COMPLETION_SEEN;
+    if (@atomicLoad(u64, &controller.polling_fallbacks, .acquire) != 0) state |= STATUS_POLL_FALLBACK_SEEN;
+    if (@atomicLoad(u64, &controller.irq_work_dropped, .acquire) != 0) state |= STATUS_IRQ_WORK_DROPPED;
+    if (@atomicLoad(u64, &controller.timeout_fallbacks, .acquire) != 0) state |= STATUS_TIMEOUT_FALLBACK_SEEN;
+    if (controller.msix_table_virt != 0 and controller.msi_enabled) state |= STATUS_MSIX_ACTIVE;
     out.* = .{
-        .state = if (namespace.identity.usable and controller.phase == .ready and
-            !@atomicLoad(bool, &controller.shutting_down, .acquire)) 1 else 0,
+        .state = state,
         .last_error = controller.last_error,
         .last_lba = controller.last_lba,
         .last_sectors = controller.last_sectors,
@@ -803,10 +1011,12 @@ fn storageSubmit(raw: ?*anyopaque, request: *const r4os.abi.StorageRequest) call
     const accepted = submitRequest(namespace, request, false);
     if (accepted != 0) return accepted;
     const controller = controllerForNamespace(namespace) orelse return -1;
-    if (!scheduleControllerWork(controller)) {
+    _ = armRuntimeInterrupts(controller);
+    if (!scheduleControllerWork(controller, false)) {
         // Driver-work capacity is an acceleration facility, not an ownership
         // prerequisite. Once accepted, a request is completed inline through
         // the same CQ drain and finite recovery path rather than stranded.
+        _ = @atomicRmw(u64, &controller.polling_fallbacks, .Add, 1, .acq_rel);
         pollControllerInline(controller, request.handle);
     }
     return 0;
@@ -837,10 +1047,14 @@ fn storageCancel(raw: ?*anyopaque, handle: u64, reason: u32) callconv(.c) i32 {
     }
     releaseController(controller);
     if (!found) return -1;
+    if (reason == r4os.abi.storage_cancel_reason_timeout) {
+        _ = @atomicRmw(u64, &controller.timeout_fallbacks, .Add, 1, .acq_rel);
+    }
     if (finish_queue) |queue_index| {
         finishIoSlot(controller, queue_index, finish_slot, cancelResult(reason), 0);
         stagePendingAndPublish(controller);
-    } else if (!scheduleControllerWork(controller)) {
+    } else if (!scheduleControllerWork(controller, false)) {
+        _ = @atomicRmw(u64, &controller.polling_fallbacks, .Add, 1, .acq_rel);
         pollControllerInline(controller, handle);
     }
     return 0;
@@ -849,7 +1063,7 @@ fn storageCancel(raw: ?*anyopaque, handle: u64, reason: u32) callconv(.c) i32 {
 fn storageReset(raw: ?*anyopaque, reason: u32) callconv(.c) i32 {
     const namespace = namespaceFromContext(raw) orelse return -1;
     const controller = controllerForNamespace(namespace) orelse return -1;
-    return if (recoverController(controller, 0, r4os.abi.storage_request_result_reset, reason)) 0 else -1;
+    return if (recoverController(controller, 0, r4os.abi.storage_request_result_reset, reason, false)) 0 else -1;
 }
 
 fn submitRequest(namespace: *NamespaceRuntime, request: *const r4os.abi.StorageRequest, bypass_admission: bool) i32 {
@@ -1072,11 +1286,45 @@ fn oldestPendingSlot(queue: *IoQueue) ?usize {
     return selected;
 }
 
-fn scheduleControllerWork(controller: *ControllerState) bool {
+fn irqHandler(irq: u8, raw_context: usize) callconv(.c) u32 {
+    const controller: *ControllerState = @ptrFromInt(raw_context);
+    if (!controller.present or !controller.mapped or !controller.irq_registered or
+        irq != controller.irq_route)
+    {
+        return 0;
+    }
+
+    // MSI/MSI-X is exclusive. Mask vector zero before deferring all CQ
+    // ownership to task context; the worker acknowledges CQ heads before
+    // unmasking it.
+    maskRuntimeInterrupts(controller);
+    _ = @atomicRmw(u64, &controller.irq_count, .Add, 1, .acq_rel);
+    _ = @atomicRmw(u64, &controller.irq_generation, .Add, 1, .acq_rel);
+    if (!nvme_state.runtimeInterruptAllowed(
+        controller.irq_registered,
+        @atomicLoad(bool, &controller.interrupts_armed, .acquire),
+        @atomicLoad(bool, &controller.accepting, .acquire),
+        @atomicLoad(bool, &controller.recovering, .acquire),
+        @atomicLoad(bool, &controller.shutting_down, .acquire),
+    )) {
+        return r4os.abi.irq_result_handled;
+    }
+    _ = @atomicRmw(u64, &controller.irq_work_wakeups, .Add, 1, .acq_rel);
+    if (!scheduleControllerWork(controller, true)) {
+        _ = @atomicRmw(u64, &controller.irq_work_dropped, .Add, 1, .acq_rel);
+        // Keep the source masked instead of creating an MSI storm. The block
+        // owner's bounded timeout/cancel path reaps capacity and performs the
+        // explicit polling/recovery fallback in task context.
+    }
+    return r4os.abi.irq_result_handled;
+}
+
+fn scheduleControllerWork(controller: *ControllerState, from_irq: bool) bool {
     if (@atomicLoad(bool, &controller.shutting_down, .acquire)) return false;
     if (@atomicRmw(bool, &controller.work_pending, .Xchg, true, .acq_rel)) return true;
     const ctx = controllerContext(controller);
-    releaseCompletedWork(controller, &ctx);
+    // Completion-handle inspection and release are task-context operations.
+    if (!from_irq) releaseCompletedWork(controller, &ctx);
     var free_index: ?usize = null;
     for (&controller.work_handles, 0..) |*stored, index| {
         if (@atomicLoad(u32, stored, .acquire) == 0) {
@@ -1089,31 +1337,87 @@ fn scheduleControllerWork(controller: *ControllerState) bool {
         return false;
     };
     var handle: u32 = 0;
-    if (ctx.workSubmit(controllerWork, @intFromPtr(controller), r4os.abi.driver_work_flag_none, &handle) != 0 or handle == 0) {
+    const flags = if (from_irq) r4os.abi.driver_work_flag_from_irq else r4os.abi.driver_work_flag_none;
+    if (ctx.workSubmit(controllerWork, @intFromPtr(controller), flags, &handle) != 0 or handle == 0) {
         @atomicStore(bool, &controller.work_pending, false, .release);
         return false;
     }
     @atomicStore(u32, &controller.work_handles[index], handle, .release);
+    if (from_irq) _ = @atomicRmw(u64, &controller.irq_work_submitted, .Add, 1, .acq_rel);
     return true;
 }
 
 fn controllerWork(raw: usize) callconv(.c) i32 {
     const controller: *ControllerState = @ptrFromInt(raw);
+    @atomicStore(bool, &controller.work_active, true, .release);
+    defer @atomicStore(bool, &controller.work_active, false, .release);
     const ctx = controllerContext(controller);
     releaseCompletedWork(controller, &ctx);
-    @atomicStore(bool, &controller.work_pending, false, .release);
-    if (@atomicLoad(bool, &controller.shutting_down, .acquire)) return 0;
+    const observed_generation = @atomicLoad(u64, &controller.irq_generation, .acquire);
+    if (@atomicLoad(bool, &controller.shutting_down, .acquire) or
+        @atomicLoad(bool, &controller.recovering, .acquire))
+    {
+        @atomicStore(bool, &controller.work_pending, false, .release);
+        return 0;
+    }
 
+    _ = @atomicRmw(u64, &controller.event_work_passes, .Add, 1, .acq_rel);
     publishSubmissionDoorbells(controller);
-    drainControllerCompletions(controller);
+    var irq_completions: usize = 0;
+    const interrupts_armed = @atomicLoad(bool, &controller.interrupts_armed, .acquire);
+    const handled_generation = @atomicLoad(u64, &controller.irq_generation_handled, .acquire);
+    if (!interrupts_armed or observed_generation != handled_generation) {
+        irq_completions = drainControllerCompletions(controller);
+        if (interrupts_armed and observed_generation != handled_generation) {
+            @atomicStore(u64, &controller.irq_generation_handled, observed_generation, .release);
+            if (irq_completions != 0) {
+                _ = @atomicRmw(u64, &controller.irq_completion_records, .Add, @intCast(irq_completions), .acq_rel);
+                logIrqAcceptanceOnce(controller);
+            }
+        }
+    }
     stagePendingAndPublish(controller);
     if (recoveryTrigger(controller)) |trigger| {
-        _ = recoverController(controller, trigger.handle, trigger.result, trigger.reason);
+        _ = recoverController(controller, trigger.handle, trigger.result, trigger.reason, true);
     }
-    if (controllerOwnsRequests(controller) and !@atomicLoad(bool, &controller.shutting_down, .acquire)) {
-        if (!scheduleControllerWork(controller)) pollControllerInline(controller, 0);
+    if (@atomicLoad(bool, &controller.interrupts_armed, .acquire) and
+        !@atomicLoad(bool, &controller.recovering, .acquire))
+    {
+        unmaskRuntimeInterrupts(controller);
+    }
+
+    @atomicStore(bool, &controller.work_pending, false, .release);
+    const latest_generation = @atomicLoad(u64, &controller.irq_generation, .acquire);
+    const owns_requests = controllerOwnsRequests(controller);
+    switch (nvme_state.runtimeWorkDecision(
+        @atomicLoad(bool, &controller.interrupts_armed, .acquire),
+        latest_generation != observed_generation,
+        owns_requests,
+        @atomicLoad(bool, &controller.shutting_down, .acquire),
+    )) {
+        .stop => {},
+        .resubmit_event => {
+            _ = scheduleControllerWork(controller, false);
+        },
+        .resubmit_poll_fallback => {
+            _ = @atomicRmw(u64, &controller.polling_fallbacks, .Add, 1, .acq_rel);
+            ctx.waitTicks(1);
+            if (!scheduleControllerWork(controller, false)) pollControllerInline(controller, 0);
+        },
     }
     return 0;
+}
+
+fn logIrqAcceptanceOnce(controller: *ControllerState) void {
+    if (@atomicLoad(u64, &controller.irq_count, .acquire) == 0 or
+        @atomicLoad(u64, &controller.irq_work_wakeups, .acquire) == 0 or
+        @atomicLoad(u64, &controller.irq_completion_records, .acquire) == 0 or
+        @atomicLoad(u64, &controller.polling_fallbacks, .acquire) != 0 or
+        @atomicRmw(bool, &controller.irq_probe_logged, .Xchg, true, .acq_rel)) return;
+    controllerContext(controller).logInfo(if (controller.msix_table_virt != 0)
+        "[NVMEIRQ] result=OK mode=msix irq=nonzero work=nonzero completions=nonzero poll_fallback=0"
+    else
+        "[NVMEIRQ] result=OK mode=msi irq=nonzero work=nonzero completions=nonzero poll_fallback=0");
 }
 
 fn releaseCompletedWork(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext) void {
@@ -1152,21 +1456,23 @@ const CompletionRecord = struct {
     bytes: u32,
 };
 
-fn drainControllerCompletions(controller: *ControllerState) void {
+fn drainControllerCompletions(controller: *ControllerState) usize {
+    var completion_count: usize = 0;
     var queue_index: usize = 0;
     while (queue_index < controller.queue_pair_count) : (queue_index += 1) {
-        drainQueueCompletions(controller, queue_index);
+        completion_count += drainQueueCompletions(controller, queue_index);
     }
+    return completion_count;
 }
 
-fn drainQueueCompletions(controller: *ControllerState, queue_index: usize) void {
+fn drainQueueCompletions(controller: *ControllerState, queue_index: usize) usize {
     var records: [MAX_QUEUE_REQUESTS]CompletionRecord = undefined;
     var record_count: usize = 0;
-    if (!acquireController(controller)) return;
+    if (!acquireController(controller)) return 0;
     const queue = &controller.queues[queue_index];
     if (!queue.configured) {
         releaseController(controller);
-        return;
+        return 0;
     }
     dmaFence();
     var consumed = false;
@@ -1220,6 +1526,7 @@ fn drainQueueCompletions(controller: *ControllerState, queue_index: usize) void 
         const record = records[index];
         finishIoSlot(controller, queue_index, record.slot_index, record.result, record.bytes);
     }
+    return record_count;
 }
 
 fn findActiveCid(queue: *IoQueue, cid: u16) ?usize {
@@ -1288,12 +1595,12 @@ fn recoveryTrigger(controller: *ControllerState) ?RecoveryTrigger {
 fn pollControllerInline(controller: *ControllerState, wait_handle: u64) void {
     while (!@atomicLoad(bool, &controller.shutting_down, .acquire)) {
         publishSubmissionDoorbells(controller);
-        drainControllerCompletions(controller);
+        _ = drainControllerCompletions(controller);
         stagePendingAndPublish(controller);
         if (wait_handle != 0 and !controllerOwnsHandle(controller, wait_handle)) return;
         if (wait_handle == 0 and !controllerOwnsRequests(controller)) return;
         if (recoveryTrigger(controller)) |trigger| {
-            if (!recoverController(controller, trigger.handle, trigger.result, trigger.reason)) return;
+            if (!recoverController(controller, trigger.handle, trigger.result, trigger.reason, false)) return;
             if (wait_handle != 0 and !controllerOwnsHandle(controller, wait_handle)) return;
         }
         controllerContext(controller).waitTicks(1);
@@ -1325,14 +1632,29 @@ fn controllerOwnsHandle(controller: *ControllerState, handle: u64) bool {
     return false;
 }
 
-fn recoverController(controller: *ControllerState, trigger_handle: u64, trigger_result: i32, reason: u32) bool {
+fn recoverController(
+    controller: *ControllerState,
+    trigger_handle: u64,
+    trigger_result: i32,
+    reason: u32,
+    from_work: bool,
+) bool {
     if (@atomicRmw(bool, &controller.recovering, .Xchg, true, .acq_rel)) return false;
     defer @atomicStore(bool, &controller.recovering, false, .release);
     if (controller.phase == .stopped or controller.shutting_down) return false;
+    const rearm_interrupts = @atomicLoad(bool, &controller.interrupts_armed, .acquire);
+    maskRuntimeInterrupts(controller);
     controller.phase = .recovering;
     @atomicStore(bool, &controller.accepting, false, .release);
     controller.recoveries +%= 1;
     announceRecovery(controller, false, false);
+
+    if (!from_work and !waitForControllerWorkIdle(controller)) {
+        controller.phase = .failed;
+        controller.recovery_failures +%= 1;
+        announceRecovery(controller, true, false);
+        return false;
+    }
 
     if (!waitForPreparingSlots(controller)) {
         controller.phase = .failed;
@@ -1352,7 +1674,7 @@ fn recoverController(controller: *ControllerState, trigger_handle: u64, trigger_
                 const grace = @max(@as(u64, 1), nvme_state.ticksFromMilliseconds(controller.timer_hz, 20));
                 while (controllerOwnsHandle(controller, trigger_handle) and !nvme_state.deadlineExpired(start, grace, ctx.tickCount())) {
                     publishSubmissionDoorbells(controller);
-                    drainControllerCompletions(controller);
+                    _ = drainControllerCompletions(controller);
                     ctx.waitTicks(1);
                 }
                 if (!controllerOwnsHandle(controller, trigger_handle)) {
@@ -1360,6 +1682,8 @@ fn recoverController(controller: *ControllerState, trigger_handle: u64, trigger_
                     @atomicStore(bool, &controller.accepting, true, .release);
                     announceRecovery(controller, true, true);
                     stagePendingAndPublish(controller);
+                    @atomicStore(bool, &controller.recovering, false, .release);
+                    if (rearm_interrupts) unmaskRuntimeInterrupts(controller);
                     return true;
                 }
             }
@@ -1392,6 +1716,8 @@ fn recoverController(controller: *ControllerState, trigger_handle: u64, trigger_
     controller.last_error = 0;
     @atomicStore(bool, &controller.accepting, true, .release);
     announceRecovery(controller, true, true);
+    @atomicStore(bool, &controller.recovering, false, .release);
+    if (rearm_interrupts) unmaskRuntimeInterrupts(controller);
     _ = reason;
     return true;
 }
@@ -1410,6 +1736,22 @@ fn activeCommandIdentity(controller: *ControllerState, handle: u64) ?CommandIden
         }
     }
     return null;
+}
+
+fn waitForControllerWorkIdle(controller: *ControllerState) bool {
+    const ctx = controllerContext(controller);
+    const start = ctx.tickCount();
+    const timeout = nvme_state.adminTimeoutTicks(controller.timer_hz);
+    // Driver Work owns one serial normal-callback lane. Include a queued
+    // successor in the join so external reset cannot slip through the short
+    // handoff between callbacks.
+    while (@atomicLoad(bool, &controller.work_active, .acquire) or
+        @atomicLoad(bool, &controller.work_pending, .acquire))
+    {
+        if (nvme_state.deadlineExpired(start, timeout, ctx.tickCount())) return false;
+        ctx.waitTicks(1);
+    }
+    return true;
 }
 
 fn waitForPreparingSlots(controller: *ControllerState) bool {
@@ -1563,10 +1905,10 @@ fn syncIo(
 
     while (!@atomicLoad(bool, &controller.sync_done, .acquire)) {
         publishSubmissionDoorbells(controller);
-        drainControllerCompletions(controller);
+        _ = drainControllerCompletions(controller);
         stagePendingAndPublish(controller);
         if (recoveryTrigger(controller)) |trigger| {
-            if (!recoverController(controller, trigger.handle, trigger.result, trigger.reason)) break;
+            if (!recoverController(controller, trigger.handle, trigger.result, trigger.reason, false)) break;
         }
         if (!controllerOwnsHandle(controller, handle) and !controller.sync_done) break;
         controllerContext(controller).waitTicks(1);
@@ -1602,7 +1944,12 @@ fn shutdownController(controller: *ControllerState, ctx: *const r4os.r4dev.Drive
     if (controller.shutdown_done) return controller.shutdown_safe;
     @atomicStore(bool, &controller.accepting, false, .release);
     @atomicStore(bool, &controller.shutting_down, true, .release);
+    maskRuntimeInterrupts(controller);
     _ = waitForPreparingSlots(controller);
+    // Join every deferred callback before synchronous flush/delete/reset
+    // mutates queue state. New shutdown-bypass I/O below is polled locally and
+    // cannot create another Driver Work handle.
+    const work_safe = releaseDriverWork(controller, ctx);
 
     var stopped = true;
     if (controller.mapped) {
@@ -1626,9 +1973,9 @@ fn shutdownController(controller: *ControllerState, ctx: *const r4os.r4dev.Drive
             write64(controller, REG_ACQ, 0);
         }
     }
-    const work_safe = releaseDriverWork(controller, ctx);
+    const irq_safe = unregisterInterrupts(controller, ctx);
     const bus_master_safe = disablePciBusMaster(controller, ctx);
-    const safe = stopped and work_safe and bus_master_safe;
+    const safe = stopped and work_safe and irq_safe and bus_master_safe;
     if (safe) {
         for (controller.queues[0..controller.queue_pair_count]) |*queue| {
             if (queue.region.phys_addr != 0) ctx.freeDmaRegion(&queue.region);
@@ -1680,6 +2027,25 @@ fn releaseDriverWork(controller: *ControllerState, ctx: *const r4os.r4dev.Driver
         }
     }
     return safe;
+}
+
+fn unregisterInterrupts(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext) bool {
+    if (controller.irq_registered) {
+        if (controller.irq_route >= 32 or
+            ctx.irqUnregister(controller.irq_route, irqHandler, @intFromPtr(controller)) != 0)
+        {
+            return false;
+        }
+        controller.irq_registered = false;
+        controller.irq_route = 0xFF;
+    }
+    @atomicStore(bool, &controller.interrupts_armed, false, .release);
+    if (controller.msi_enabled) {
+        if (ctx.pciDisableMsi(controller.info) != 0) return false;
+        controller.msi_enabled = false;
+        controller.msix_table_virt = 0;
+    }
+    return true;
 }
 
 fn disablePciBusMaster(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext) bool {

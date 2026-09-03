@@ -28,10 +28,17 @@ neuen CQ-Head nur einmal. Completion-CID, Controller-, Namespace-, Queue- und
 Slotgeneration verhindern eine Zuordnung zu wiederverwendetem Besitz.
 
 Vor dem Scheduler benutzt der Blockscan die synchronen v1-Callbacks ueber
-dieselben DMA-, Queue- und Completionpfade. Sobald der Blockworker laeuft,
-wechselt derselbe Backenddeskriptor auf nichtblockierendes Submit. Der
-begrenzte Poll-/Deferred-Work-Pfad bleibt auch ohne MSI-X oder bei fehlender
-Workqueuekapazitaet korrekt.
+dieselben DMA-, Queue- und Completionpfade. Die I/O-CQs werden mit IEN und
+Interruptvektor null angelegt, die PCI-MSI-/MSI-X-Route bleibt jedoch fuer den
+gesamten Preload deaktiviert. Erst die erste asynchrone Runtime-Anfrage richtet
+sie ein und gibt den Vektor nach erfolgreicher IRQ-Registrierung frei. Jeder
+Eingang maskiert INTMS und bei MSI-X zusaetzlich den wirklichen Tabelleneintrag,
+bevor er die CQ-Auswertung mit `driver_work_flag_from_irq` an genau einen
+endlichen Driver-Work-Durchlauf uebergibt. Der Worker bestaetigt die CQ-Heads
+vor dem erneuten Freigeben; eine raced Generation erhaelt hoechstens einen
+Nachfolger. Bei aktiven Message-Interrupts gibt es kein staendiges
+Selbst-Reposting. Polling bleibt auf synchronen Boot-I/O, fehlendes MSI/MSI-X
+beziehungsweise Work-Kapazitaet, Timeout und Recovery begrenzt.
 
 Ein synchroner, idempotenter Read wird nach einer nachweislich erfolgreichen
 Transport-Recovery genau einmal erneut ausgegeben. Damit kann der fruehe
@@ -57,14 +64,19 @@ wechselt alle Besitzgenerationen und baut Admin- sowie I/O-Queues neu auf.
 Das aktive Namespaceinventar und seine Geometrie muessen danach exakt zum
 registrierten Bestand passen; andernfalls bleibt das Backend fehlgeschlagen.
 
-Der Shutdown schliesst zuerst neue Storage-Aufrufe. Nach dem vom Blocklayer
+Der Shutdown schliesst zuerst neue Storage-Aufrufe und maskiert den
+MSI-/MSI-X-Vektor.
+Nach dem vom Blocklayer
 bewiesenen Stillstand versucht er fuer alle registrierten Namespaces einen
 begrenzten Flush sowie die geordnete Loeschung von SQ vor CQ. Unabhaengig von
 diesen Komfortschritten ist CC.EN=0 mit beobachtetem CSTS.RDY=0 die harte
-DMA-Sicherheitsgrenze. DMA wird erst danach und nach nachweislich deaktiviertem
-PCI Bus Mastering freigegeben. Scheitert dieser Beweis, bleiben Controller,
-Queues und Payloadabbildungen fuer einen spaeteren Retry quarantainisiert.
-Auch partielle Initialisierung benutzt denselben Abbau.
+DMA-Sicherheitsgrenze. Erst danach werden laufende Driver-Work-Handles
+vollstaendig abgewartet, der IRQ abgemeldet und MSI/MSI-X deaktiviert. DMA wird nur nach diesem
+Nachweis und nach deaktiviertem PCI Bus Mastering freigegeben. Recovery maskiert
+dieselbe Quelle ueber Queue-Reset und Neuaufbau und gibt sie erst nach dem
+Generationswechsel wieder frei. Scheitert ein Beweis, bleiben Controller,
+Queues und Payloadabbildungen fuer einen spaeteren Retry quarantaenisiert. Auch
+partielle Initialisierung benutzt denselben Abbau.
 
 Projektstruktur und Build
 -------------------------

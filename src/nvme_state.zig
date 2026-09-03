@@ -9,6 +9,47 @@ pub const PollDecision = enum {
     wait,
 };
 
+pub const RuntimeWorkDecision = enum {
+    stop,
+    resubmit_event,
+    resubmit_poll_fallback,
+};
+
+/// CDW11 for Create I/O Completion Queue: PC is always set because each CQ
+/// owns one contiguous DMA page range. IEN and IV are coupled; callers may
+/// create an interrupt-capable queue while keeping its PCI message route
+/// disabled until the asynchronous runtime begins.
+pub fn ioCompletionQueueControl(interrupts_enabled: bool, vector: u16) u32 {
+    return 1 |
+        (if (interrupts_enabled) @as(u32, 1 << 1) else 0) |
+        (if (interrupts_enabled) @as(u32, vector) << 16 else 0);
+}
+
+/// Event-driven runtime queues stop after one finite pass. A raced IRQ owns a
+/// bounded successor; only controllers without a usable MSI route retain the
+/// old polling continuation as an explicit fallback.
+pub fn runtimeWorkDecision(
+    interrupts_armed: bool,
+    generation_changed: bool,
+    owns_requests: bool,
+    shutting_down: bool,
+) RuntimeWorkDecision {
+    if (shutting_down) return .stop;
+    if (generation_changed) return .resubmit_event;
+    if (owns_requests and !interrupts_armed) return .resubmit_poll_fallback;
+    return .stop;
+}
+
+pub fn runtimeInterruptAllowed(
+    registered: bool,
+    armed: bool,
+    accepting: bool,
+    recovering: bool,
+    shutting_down: bool,
+) bool {
+    return registered and armed and accepting and !recovering and !shutting_down;
+}
+
 pub const QueueContract = struct {
     ring_entries: u16,
     in_flight: u16,
@@ -317,6 +358,40 @@ test "queue-pair negotiation honors both returned dimensions and fallback" {
     const fallback = queuePairAllocation(8, false, 0);
     try std.testing.expectEqual(@as(u16, 1), fallback.usable);
     try std.testing.expect(!fallback.negotiated);
+}
+
+test "I/O completion queues couple IEN to a valid vector choice" {
+    try std.testing.expectEqual(@as(u32, 0x0000_0001), ioCompletionQueueControl(false, 7));
+    try std.testing.expectEqual(@as(u32, 0x0000_0003), ioCompletionQueueControl(true, 0));
+    try std.testing.expectEqual(@as(u32, 0x0007_0003), ioCompletionQueueControl(true, 7));
+}
+
+test "runtime work is event-driven with only an explicit polling fallback" {
+    try std.testing.expectEqual(
+        RuntimeWorkDecision.stop,
+        runtimeWorkDecision(true, false, true, false),
+    );
+    try std.testing.expectEqual(
+        RuntimeWorkDecision.resubmit_event,
+        runtimeWorkDecision(true, true, true, false),
+    );
+    try std.testing.expectEqual(
+        RuntimeWorkDecision.resubmit_poll_fallback,
+        runtimeWorkDecision(false, false, true, false),
+    );
+    try std.testing.expectEqual(
+        RuntimeWorkDecision.stop,
+        runtimeWorkDecision(false, true, true, true),
+    );
+}
+
+test "interrupt lifecycle keeps preload recovery and shutdown masked" {
+    try std.testing.expect(!runtimeInterruptAllowed(true, false, true, false, false));
+    try std.testing.expect(!runtimeInterruptAllowed(false, true, true, false, false));
+    try std.testing.expect(runtimeInterruptAllowed(true, true, true, false, false));
+    try std.testing.expect(!runtimeInterruptAllowed(true, true, false, false, false));
+    try std.testing.expect(!runtimeInterruptAllowed(true, true, true, true, false));
+    try std.testing.expect(!runtimeInterruptAllowed(true, true, true, false, true));
 }
 
 test "namespace pages continue without repeating or losing the boundary NSID" {

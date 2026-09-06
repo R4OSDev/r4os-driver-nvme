@@ -40,8 +40,9 @@ CAP.TO-derived monotonic deadlines bound controller transitions; Admin and I/O
 completions have separate finite deadlines. Timeout and cancellation run
 through best-effort Abort and, when required, a controller reset that changes
 controller, namespace, queue, and slot generations before queues are rebuilt.
-Every accepted request receives exactly one terminal result; failed recovery
-leaves the backend explicitly failed and retains unsafe DMA ownership. Reset
+Completion is generation-bound; failed recovery leaves the backend explicitly
+failed and retains unsafe DMA ownership. The current synchronous boot callback
+can return an error before that retained DMA ownership ends. Reset
 and shutdown mask the device source before queue mutation, and shutdown joins
 Driver Work and unregisters MSI/MSI-X before bus mastering and DMA ownership
 end.

@@ -77,6 +77,10 @@ dieselbe Quelle ueber Queue-Reset und Neuaufbau und gibt sie erst nach dem
 Generationswechsel wieder frei. Scheitert ein Beweis, bleiben Controller,
 Queues und Payloadabbildungen fuer einen spaeteren Retry quarantaenisiert. Auch
 partielle Initialisierung benutzt denselben Abbau.
+Der synchrone Bootcallback kann bei fehlgeschlagener Recovery derzeit trotzdem
+bereits einen Fehler zurueckgeben, obwohl eine Payloadabbildung noch dem
+Controller gehoert. Die Quarantaene der Seiten allein beendet diesen Zugriff
+auf den uebergebenen Puffer nicht.
 
 Projektstruktur und Build
 -------------------------
@@ -92,6 +96,7 @@ Unter Linux:
 
     ./Build.sh test
 
-Das Artefakt entsteht als `zig-out/NVME.R4D`; `module.R4MF` ist die kanonische
+Das Artefakt entsteht gemaess ARTIFACTS_ROOT als
+`Artifacts/Modules/NVME/NVME.R4D` im Workspace; `module.R4MF` ist die kanonische
 Build-, Versions- und Imagequelle. Das Imageziel lautet
 `/R4OS/DRIVERS/NVME.R4D`.

@@ -140,6 +140,7 @@ const IoSlot = struct {
     complete: ?r4os.abi.StorageRequestComplete = null,
     pin: r4os.abi.DmaPinnedBuffer = .{},
     mapping: r4os.abi.DmaMapping = .{},
+    shared_buffer: ?*r4os.r4dev.SharedDmaBuffer = null,
 };
 
 const IoQueue = struct {
@@ -1067,6 +1068,10 @@ fn storageReset(raw: ?*anyopaque, reason: u32) callconv(.c) i32 {
 }
 
 fn submitRequest(namespace: *NamespaceRuntime, request: *const r4os.abi.StorageRequest, bypass_admission: bool) i32 {
+    return submitRequestWithBuffer(namespace, request, bypass_admission, null);
+}
+
+fn submitRequestWithBuffer(namespace: *NamespaceRuntime, request: *const r4os.abi.StorageRequest, bypass_admission: bool, shared_buffer: ?*r4os.r4dev.SharedDmaBuffer) i32 {
     const controller = controllerForNamespace(namespace) orelse return -1;
     if (request.version != r4os.abi.storage_request_version or request.size < @sizeOf(r4os.abi.StorageRequest) or
         request.handle == 0 or request.flags != 0)
@@ -1088,6 +1093,10 @@ fn submitRequest(namespace: *NamespaceRuntime, request: *const r4os.abi.StorageR
         releaseController(controller);
         return 1;
     };
+    if (shared_buffer) |buffer| {
+        buffer.retain();
+        queue.slots[slot_index].shared_buffer = buffer;
+    }
     releaseController(controller);
 
     var prepared = true;
@@ -1228,6 +1237,10 @@ fn rejectPreparedSlot(controller: *ControllerState, queue_index: usize, slot_ind
     const ctx = controllerContext(controller);
     if (slot.mapping.handle != 0) _ = ctx.unmapDma(&slot.mapping);
     if (slot.pin.handle != 0) _ = ctx.unpinDmaBuffer(&slot.pin);
+    if (slot.shared_buffer) |buffer| {
+        slot.shared_buffer = null;
+        buffer.release(&ctx);
+    }
     if (!acquireController(controller)) return;
     if (slot.state == .preparing) {
         const generation = slot.generation;
@@ -1544,6 +1557,10 @@ fn finishIoSlot(controller: *ControllerState, queue_index: usize, slot_index: us
     const ctx = controllerContext(controller);
     if (slot.mapping.handle != 0) _ = ctx.unmapDma(&slot.mapping);
     if (slot.pin.handle != 0) _ = ctx.unpinDmaBuffer(&slot.pin);
+    if (slot.shared_buffer) |buffer| {
+        slot.shared_buffer = null;
+        buffer.release(&ctx);
+    }
     const complete = slot.complete;
     const handle = slot.handle;
     if (complete) |callback| callback(handle, result, bytes);
@@ -1881,25 +1898,35 @@ fn syncIo(
     const controller = controllerForNamespace(namespace) orelse return -1;
     if (@atomicRmw(bool, &controller.sync_busy, .Xchg, true, .acq_rel)) return -2;
     defer @atomicStore(bool, &controller.sync_busy, false, .release);
-    next_sync_sequence +%= 1;
-    if (next_sync_sequence == 0) next_sync_sequence = 1;
-    const handle = 0xFFFE_0000_0000_0000 | next_sync_sequence;
-    controller.sync_handle = handle;
-    controller.sync_done = false;
+    if (!validateTransfer(namespace, operation, lba, sectors, buffer_bytes, buffer_addr)) return -3;
+    const ctx = controllerContext(controller);
+    const buffer = if (operation == r4os.abi.storage_request_op_flush) null else r4os.r4dev.SharedDmaBuffer.create(&ctx, buffer_bytes, std.math.maxInt(u64)) orelse return -3;
+    defer if (buffer) |owned| owned.release(&ctx);
+    if (operation == r4os.abi.storage_request_op_write) {
+        const source: [*]const u8 = @ptrFromInt(buffer_addr);
+        @memcpy(buffer.?.data(), source[0..buffer_bytes]);
+    }
+    var sequence: u64 = 0;
+    while (sequence == 0)
+        sequence = (@atomicRmw(u64, &next_sync_sequence, .Add, 1, .monotonic) +% 1) & 0x0000_3FFF_FFFF_FFFF;
+    // Low two bits belong to the completion claim; request handles keep them zero.
+    const handle = 0xFFFE_0000_0000_0000 | (sequence << 2);
+    @atomicStore(bool, &controller.sync_done, false, .monotonic);
     controller.sync_result = r4os.abi.storage_request_result_error;
     controller.sync_bytes = 0;
+    @atomicStore(u64, &controller.sync_handle, handle | 1, .release);
     const request = r4os.abi.StorageRequest{
         .handle = handle,
         .operation = operation,
         .lba = lba,
         .sectors = sectors,
         .buffer_bytes = buffer_bytes,
-        .buffer_addr = buffer_addr,
+        .buffer_addr = if (buffer) |owned| @intFromPtr(owned.data().ptr) else 0,
         .complete = syncComplete,
     };
-    const submitted = submitRequest(namespace, &request, bypass_admission);
+    const submitted = submitRequestWithBuffer(namespace, &request, bypass_admission, buffer);
     if (submitted != 0) {
-        controller.sync_handle = 0;
+        finishSyncClaim(controller, handle);
         return submitted;
     }
 
@@ -1910,23 +1937,43 @@ fn syncIo(
         if (recoveryTrigger(controller)) |trigger| {
             if (!recoverController(controller, trigger.handle, trigger.result, trigger.reason, false)) break;
         }
-        if (!controllerOwnsHandle(controller, handle) and !controller.sync_done) break;
+        if (!controllerOwnsHandle(controller, handle) and !@atomicLoad(bool, &controller.sync_done, .acquire)) break;
         controllerContext(controller).waitTicks(1);
     }
-    controller.sync_handle = 0;
+    finishSyncClaim(controller, handle);
     const expected_bytes: u32 = if (operation == r4os.abi.storage_request_op_flush) 0 else buffer_bytes;
-    return if (controller.sync_done and
+    const ok = @atomicLoad(bool, &controller.sync_done, .acquire) and
         controller.sync_result == r4os.abi.storage_request_result_ok and
-        controller.sync_bytes == expected_bytes) 0 else -3;
+        controller.sync_bytes == expected_bytes;
+    if (ok and operation == r4os.abi.storage_request_op_read) {
+        const destination: [*]u8 = @ptrFromInt(buffer_addr);
+        @memcpy(destination[0..buffer_bytes], buffer.?.data());
+    }
+    return if (ok) 0 else -3;
 }
 
+// Completion and detach claim the same generation. A late callback cannot
+// publish into the result fields of a subsequent synchronous request.
 fn syncComplete(handle: u64, result: i32, bytes: u32) callconv(.c) void {
     for (controllers[0..controller_count]) |*controller| {
-        if (controller.sync_handle != handle) continue;
+        if (@cmpxchgStrong(u64, &controller.sync_handle, handle | 1, handle | 2, .acq_rel, .acquire) != null) continue;
         controller.sync_result = result;
         controller.sync_bytes = bytes;
         @atomicStore(bool, &controller.sync_done, true, .release);
+        @atomicStore(u64, &controller.sync_handle, handle | 3, .release);
         return;
+    }
+}
+
+fn finishSyncClaim(controller: *ControllerState, handle: u64) void {
+    while (true) {
+        const claim = @atomicLoad(u64, &controller.sync_handle, .acquire);
+        if ((claim & ~@as(u64, 3)) != handle) return;
+        if (claim == (handle | 2)) {
+            controllerContext(controller).waitTicks(1);
+            continue;
+        }
+        if (@cmpxchgStrong(u64, &controller.sync_handle, claim, 0, .acq_rel, .acquire) == null) return;
     }
 }
 

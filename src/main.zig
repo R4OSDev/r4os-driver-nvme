@@ -1,6 +1,8 @@
 const std = @import("std");
 const r4os = @import("r4os");
 const nvme_state = @import("nvme_state.zig");
+const dma_cleanup = @import("dma_cleanup.zig");
+const observation = @import("observation.zig");
 
 const CLASS_MASS_STORAGE: u8 = 0x01;
 const SUBCLASS_NVME: u8 = 0x08;
@@ -138,6 +140,9 @@ const IoSlot = struct {
     prp1: u64 = 0,
     prp2: u64 = 0,
     complete: ?r4os.abi.StorageRequestComplete = null,
+    observation: observation.Bound = .{},
+    finishing: bool = false,
+    cleanup_retained: bool = false,
     pin: r4os.abi.DmaPinnedBuffer = .{},
     mapping: r4os.abi.DmaMapping = .{},
     shared_buffer: ?*r4os.r4dev.SharedDmaBuffer = null,
@@ -179,6 +184,7 @@ const NamespaceRuntime = struct {
 };
 
 const ControllerState = struct {
+    cleanup_retained: bool = false,
     used: bool = false,
     index: u8 = 0,
     api: ?*const r4os.r4dev.DriverApi = null,
@@ -984,7 +990,8 @@ fn storageShutdown(raw: ?*anyopaque) callconv(.c) i32 {
 fn storageStatus(raw: ?*anyopaque, out: *r4os.abi.StorageBackendStatus) callconv(.c) i32 {
     const namespace = namespaceFromContext(raw) orelse return -1;
     const controller = controllerForNamespace(namespace) orelse return -1;
-    var state: u32 = 0;
+    var state: u32 = r4os.abi.storage_backend_status_observation_supported;
+    if (@atomicLoad(bool, &controller.cleanup_retained, .acquire)) state |= r4os.abi.storage_backend_status_cleanup_retained;
     if (namespace.identity.usable and controller.phase == .ready and
         !@atomicLoad(bool, &controller.shutting_down, .acquire)) state |= STATUS_READY;
     if (controller.irq_registered) state |= STATUS_IRQ_REGISTERED;
@@ -1038,7 +1045,6 @@ fn storageCancel(raw: ?*anyopaque, handle: u64, reason: u32) callconv(.c) i32 {
             if (slot.cancel_reason == 0) slot.cancel_reason = reason;
             if (slot.state == .pending) {
                 slot.state = .completing;
-                if (queue.owned_count != 0) queue.owned_count -= 1;
                 finish_queue = queue_index;
                 finish_slot = slot_index;
             }
@@ -1074,10 +1080,11 @@ fn submitRequest(namespace: *NamespaceRuntime, request: *const r4os.abi.StorageR
 fn submitRequestWithBuffer(namespace: *NamespaceRuntime, request: *const r4os.abi.StorageRequest, bypass_admission: bool, shared_buffer: ?*r4os.r4dev.SharedDmaBuffer) i32 {
     const controller = controllerForNamespace(namespace) orelse return -1;
     if (request.version != r4os.abi.storage_request_version or request.size < @sizeOf(r4os.abi.StorageRequest) or
-        request.handle == 0 or request.flags != 0)
+        request.handle == 0)
     {
         return -1;
     }
+    const bound = observation.bind(request) orelse return -1;
     if (!bypass_admission and (!@atomicLoad(bool, &controller.accepting, .acquire) or
         @atomicLoad(bool, &controller.shutting_down, .acquire)))
     {
@@ -1089,7 +1096,7 @@ fn submitRequestWithBuffer(namespace: *NamespaceRuntime, request: *const r4os.ab
     const queue_index: usize = namespace.queue_index;
     if (queue_index >= controller.queue_pair_count or !acquireController(controller)) return -4;
     const queue = &controller.queues[queue_index];
-    const slot_index = reserveIoSlotLocked(controller, queue, namespace, request) orelse {
+    const slot_index = reserveIoSlotLocked(controller, queue, namespace, request, bound) orelse {
         releaseController(controller);
         return 1;
     };
@@ -1104,12 +1111,12 @@ fn submitRequestWithBuffer(namespace: *NamespaceRuntime, request: *const r4os.ab
         prepared = prepareDmaMapping(controller, queue, slot_index, request);
     }
     if (!prepared) {
-        rejectPreparedSlot(controller, queue_index, slot_index);
+        if (!rejectPreparedSlot(controller, queue_index, slot_index)) return 0;
         return -5;
     }
 
     if (!acquireController(controller)) {
-        rejectPreparedSlot(controller, queue_index, slot_index);
+        if (!rejectPreparedSlot(controller, queue_index, slot_index)) return 0;
         return -6;
     }
     const slot = &queue.slots[slot_index];
@@ -1119,13 +1126,12 @@ fn submitRequestWithBuffer(namespace: *NamespaceRuntime, request: *const r4os.ab
         slot.namespace_generation != namespace.generation)
     {
         releaseController(controller);
-        rejectPreparedSlot(controller, queue_index, slot_index);
+        if (!rejectPreparedSlot(controller, queue_index, slot_index)) return 0;
         return -7;
     }
     if (slot.cancel_reason != 0) {
         const result = cancelResult(slot.cancel_reason);
         slot.state = .completing;
-        if (queue.owned_count != 0) queue.owned_count -= 1;
         releaseController(controller);
         finishIoSlot(controller, queue_index, slot_index, result, 0);
         return 0;
@@ -1144,6 +1150,7 @@ fn reserveIoSlotLocked(
     queue: *IoQueue,
     namespace: *NamespaceRuntime,
     request: *const r4os.abi.StorageRequest,
+    bound: observation.Bound,
 ) ?usize {
     if (!queue.configured or queue.owned_count >= queue.slots.len) return null;
     for (&queue.slots, 0..) |*slot, index| {
@@ -1161,6 +1168,7 @@ fn reserveIoSlotLocked(
             .sectors = @intCast(request.sectors),
             .bytes = request.buffer_bytes,
             .complete = request.complete,
+            .observation = bound,
         };
         queue.owned_count += 1;
         return index;
@@ -1197,12 +1205,9 @@ fn prepareDmaMapping(
     else
         r4os.abi.dma_direction_to_device;
     if (ctx.mapDmaPinned(&slot.pin, &constraints, direction, &slot.mapping) != 0) {
-        _ = ctx.unpinDmaBuffer(&slot.pin);
         return false;
     }
     if (!buildSlotPrps(queue, slot_index, slot)) {
-        _ = ctx.unmapDma(&slot.mapping);
-        _ = ctx.unpinDmaBuffer(&slot.pin);
         return false;
     }
     return true;
@@ -1230,24 +1235,53 @@ fn buildSlotPrps(queue: *IoQueue, slot_index: usize, slot: *IoSlot) bool {
     return true;
 }
 
-fn rejectPreparedSlot(controller: *ControllerState, queue_index: usize, slot_index: usize) void {
-    if (queue_index >= controller.queue_pair_count) return;
-    const queue = &controller.queues[queue_index];
-    const slot = &queue.slots[slot_index];
+fn retainSlotCleanup(controller: *ControllerState, slot: *IoSlot) void {
+    @atomicStore(bool, &slot.cleanup_retained, true, .release);
+    @atomicStore(bool, &controller.accepting, false, .release);
+    if (!@atomicRmw(bool, &controller.cleanup_retained, .Xchg, true, .acq_rel)) {
+        controllerContext(controller).logError("NVME.R4D DMA release not acknowledged; slot, callback and resources retained");
+    }
+}
+
+fn releaseSlotBuffers(controller: *ControllerState, slot: *IoSlot) bool {
     const ctx = controllerContext(controller);
-    if (slot.mapping.handle != 0) _ = ctx.unmapDma(&slot.mapping);
-    if (slot.pin.handle != 0) _ = ctx.unpinDmaBuffer(&slot.pin);
+    if (dma_cleanup.release(&ctx, &slot.mapping, &slot.pin) != .released) {
+        retainSlotCleanup(controller, slot);
+        return false;
+    }
     if (slot.shared_buffer) |buffer| {
         slot.shared_buffer = null;
         buffer.release(&ctx);
     }
-    if (!acquireController(controller)) return;
-    if (slot.state == .preparing) {
-        const generation = slot.generation;
-        slot.* = .{ .generation = generation };
-        if (queue.owned_count != 0) queue.owned_count -= 1;
+    return true;
+}
+
+fn rejectPreparedSlot(controller: *ControllerState, queue_index: usize, slot_index: usize) bool {
+    if (queue_index >= controller.queue_pair_count or slot_index >= MAX_QUEUE_REQUESTS) return false;
+    const queue = &controller.queues[queue_index];
+    const slot = &queue.slots[slot_index];
+    if (!acquireController(controller)) return false;
+    if (slot.state != .preparing or slot.finishing or @atomicLoad(bool, &slot.cleanup_retained, .acquire)) {
+        releaseController(controller);
+        return false;
     }
+    slot.finishing = true;
+    const handle = slot.handle;
+    const generation = slot.generation;
     releaseController(controller);
+    if (!releaseSlotBuffers(controller, slot)) return false;
+    if (!acquireController(controller)) {
+        retainSlotCleanup(controller, slot);
+        return false;
+    }
+    defer releaseController(controller);
+    if (slot.state != .preparing or slot.handle != handle or slot.generation != generation) {
+        retainSlotCleanup(controller, slot);
+        return false;
+    }
+    slot.* = .{ .generation = generation };
+    if (queue.owned_count != 0) queue.owned_count -= 1;
+    return true;
 }
 
 fn stagePendingCommandsLocked(controller: *ControllerState, queue: *IoQueue) void {
@@ -1374,13 +1408,18 @@ fn controllerWork(raw: usize) callconv(.c) i32 {
         return 0;
     }
 
-    _ = @atomicRmw(u64, &controller.event_work_passes, .Add, 1, .acq_rel);
+    const work_sequence = @atomicRmw(u64, &controller.event_work_passes, .Add, 1, .acq_rel) +% 1;
     publishSubmissionDoorbells(controller);
     var irq_completions: usize = 0;
     const interrupts_armed = @atomicLoad(bool, &controller.interrupts_armed, .acquire);
     const handled_generation = @atomicLoad(u64, &controller.irq_generation_handled, .acquire);
     if (!interrupts_armed or observed_generation != handled_generation) {
-        irq_completions = drainControllerCompletions(controller);
+        const irq_path = interrupts_armed and observed_generation != handled_generation;
+        irq_completions = drainControllerCompletionsObserved(controller, .{
+            .flags = r4os.abi.storage_observation_flag_worker | (if (irq_path) r4os.abi.storage_observation_flag_irq else r4os.abi.storage_observation_flag_poll),
+            .irq_generation = if (irq_path) observed_generation else 0,
+            .work_sequence = work_sequence,
+        });
         if (interrupts_armed and observed_generation != handled_generation) {
             @atomicStore(u64, &controller.irq_generation_handled, observed_generation, .release);
             if (irq_completions != 0) {
@@ -1467,18 +1506,22 @@ const CompletionRecord = struct {
     slot_index: usize,
     result: i32,
     bytes: u32,
+    hardware_status: u32,
 };
 
 fn drainControllerCompletions(controller: *ControllerState) usize {
+    return drainControllerCompletionsObserved(controller, .{ .flags = r4os.abi.storage_observation_flag_poll });
+}
+fn drainControllerCompletionsObserved(controller: *ControllerState, path: observation.Path) usize {
     var completion_count: usize = 0;
     var queue_index: usize = 0;
     while (queue_index < controller.queue_pair_count) : (queue_index += 1) {
-        completion_count += drainQueueCompletions(controller, queue_index);
+        completion_count += drainQueueCompletions(controller, queue_index, path);
     }
     return completion_count;
 }
 
-fn drainQueueCompletions(controller: *ControllerState, queue_index: usize) usize {
+fn drainQueueCompletions(controller: *ControllerState, queue_index: usize, path: observation.Path) usize {
     var records: [MAX_QUEUE_REQUESTS]CompletionRecord = undefined;
     var record_count: usize = 0;
     if (!acquireController(controller)) return 0;
@@ -1519,11 +1562,10 @@ fn drainQueueCompletions(controller: *ControllerState, queue_index: usize) usize
             slot.operation != r4os.abi.storage_request_op_flush) slot.bytes else 0;
         slot.state = .completing;
         if (queue.active_count != 0) queue.active_count -= 1;
-        if (queue.owned_count != 0) queue.owned_count -= 1;
         queue.completions +%= 1;
         controller.io_completions +%= 1;
         if (result != r4os.abi.storage_request_result_ok) controller.io_failures +%= 1;
-        records[record_count] = .{ .slot_index = slot_index, .result = result, .bytes = bytes };
+        records[record_count] = .{ .slot_index = slot_index, .result = result, .bytes = bytes, .hardware_status = status };
         record_count += 1;
     }
     if (consumed) {
@@ -1537,7 +1579,9 @@ fn drainQueueCompletions(controller: *ControllerState, queue_index: usize) usize
     var index: usize = 0;
     while (index < record_count) : (index += 1) {
         const record = records[index];
-        finishIoSlot(controller, queue_index, record.slot_index, record.result, record.bytes);
+        var completed_path = path;
+        completed_path.flags |= r4os.abi.storage_observation_flag_cqe;
+        finishIoSlotObserved(controller, queue_index, record.slot_index, record.result, record.bytes, completed_path, record.hardware_status);
     }
     return record_count;
 }
@@ -1550,27 +1594,65 @@ fn findActiveCid(queue: *IoQueue, cid: u16) ?usize {
 }
 
 fn finishIoSlot(controller: *ControllerState, queue_index: usize, slot_index: usize, result: i32, bytes: u32) void {
+    finishIoSlotObserved(controller, queue_index, slot_index, result, bytes, .{}, 0);
+}
+fn finishIoSlotObserved(controller: *ControllerState, queue_index: usize, slot_index: usize, result: i32, bytes: u32, path: observation.Path, hardware_status: u32) void {
     if (queue_index >= controller.queue_pair_count or slot_index >= MAX_QUEUE_REQUESTS) return;
     const queue = &controller.queues[queue_index];
     const slot = &queue.slots[slot_index];
-    if (slot.state != .completing) return;
-    const ctx = controllerContext(controller);
-    if (slot.mapping.handle != 0) _ = ctx.unmapDma(&slot.mapping);
-    if (slot.pin.handle != 0) _ = ctx.unpinDmaBuffer(&slot.pin);
-    if (slot.shared_buffer) |buffer| {
-        slot.shared_buffer = null;
-        buffer.release(&ctx);
-    }
-    const complete = slot.complete;
-    const handle = slot.handle;
-    if (complete) |callback| callback(handle, result, bytes);
-
     if (!acquireController(controller)) return;
-    if (slot.state == .completing and slot.handle == handle) {
-        const generation = slot.generation;
-        slot.* = .{ .generation = generation };
+    if (slot.state != .completing or slot.finishing or @atomicLoad(bool, &slot.cleanup_retained, .acquire)) {
+        releaseController(controller);
+        return;
     }
+    slot.finishing = true;
+    const handle = slot.handle;
+    const generation = slot.generation;
+    const complete = slot.complete;
     releaseController(controller);
+    if (!releaseSlotBuffers(controller, slot)) return;
+    if (slot.observation.callback) |observe| {
+        var flags = path.flags | r4os.abi.storage_observation_flag_dma_released;
+        if (slot.cancel_reason != 0) flags |= r4os.abi.storage_observation_flag_cancel;
+        // Reset can finish an already submitted command without a CQE;
+        // its absence does not prove that the command was never submitted.
+        if (slot.controller_generation != controller.generation or slot.namespace_slot >= controller.namespace_count or
+            slot.namespace_generation != controller.namespaces[slot.namespace_slot].generation) flags |= r4os.abi.storage_observation_flag_epoch_changed;
+        const namespace_id = if (slot.namespace_slot < controller.namespace_count) controller.namespaces[slot.namespace_slot].identity.nsid else 0;
+        const witness = r4os.abi.StorageRequestObservation{
+            .flags = flags,
+            .controller_index = controller.index,
+            .controller_generation = slot.controller_generation,
+            .namespace_generation = slot.namespace_generation,
+            .namespace_id = namespace_id,
+            .namespace_slot = slot.namespace_slot,
+            .queue_id = queue.qid,
+            .command_id = slot.cid,
+            .hardware_status = hardware_status,
+            .result = result,
+            .bytes = bytes,
+            .irq_mode = if (!controller.irq_registered) r4os.abi.storage_observation_irq_none else if (controller.msix_table_virt != 0 and controller.msi_enabled) r4os.abi.storage_observation_irq_msix else r4os.abi.storage_observation_irq_msi,
+            .handle = handle,
+            .irq_generation = path.irq_generation,
+            .work_sequence = path.work_sequence,
+            .command_sequence = slot.sequence,
+            .start_tick = slot.start_tick,
+            .finish_tick = controllerContext(controller).tickCount(),
+        };
+        observe(slot.observation.cookie, &witness);
+    }
+    if (complete) |callback| callback(handle, result, bytes);
+    if (!acquireController(controller)) {
+        retainSlotCleanup(controller, slot);
+        return;
+    }
+    defer releaseController(controller);
+    if (slot.state != .completing or slot.handle != handle or slot.generation != generation) {
+        retainSlotCleanup(controller, slot);
+        return;
+    }
+    slot.* = .{ .generation = generation };
+    if (queue.owned_count != 0) queue.owned_count -= 1;
 }
 
 const RecoveryTrigger = struct {
@@ -1656,6 +1738,7 @@ fn recoverController(
     reason: u32,
     from_work: bool,
 ) bool {
+    if (@atomicLoad(bool, &controller.cleanup_retained, .acquire)) return false;
     if (@atomicRmw(bool, &controller.recovering, .Xchg, true, .acq_rel)) return false;
     defer @atomicStore(bool, &controller.recovering, false, .release);
     if (controller.phase == .stopped or controller.shutting_down) return false;
@@ -1718,7 +1801,11 @@ fn recoverController(
     for (controller.namespaces[0..controller.namespace_count]) |*namespace| {
         namespace.generation = nextGeneration(namespace.generation);
     }
-    finishAllOwnedRequests(controller, trigger_handle, trigger_result);
+    if (!finishAllOwnedRequests(controller, trigger_handle, trigger_result)) {
+        controller.phase = .failed;
+        controller.recovery_failures +%= 1;
+        return false;
+    }
     resetQueueMemoryAndSoftware(controller);
     resetAdminMemoryAndSoftware(controller);
     configureAdminQueue(controller);
@@ -1790,19 +1877,18 @@ fn waitForPreparingSlots(controller: *ControllerState) bool {
     }
 }
 
-fn finishAllOwnedRequests(controller: *ControllerState, trigger_handle: u64, trigger_result: i32) void {
+fn finishAllOwnedRequests(controller: *ControllerState, trigger_handle: u64, trigger_result: i32) bool {
     var queue_index: usize = 0;
     while (queue_index < controller.queue_pair_count) : (queue_index += 1) {
         var slot_index: usize = 0;
         while (slot_index < MAX_QUEUE_REQUESTS) : (slot_index += 1) {
-            if (!acquireController(controller)) return;
+            if (!acquireController(controller)) return false;
             const queue = &controller.queues[queue_index];
             const slot = &queue.slots[slot_index];
             if (slot.state == .pending or slot.state == .active) {
                 const was_active = slot.state == .active;
                 slot.state = .completing;
                 if (was_active and queue.active_count != 0) queue.active_count -= 1;
-                if (queue.owned_count != 0) queue.owned_count -= 1;
                 const result = if (slot.handle == trigger_handle and trigger_handle != 0)
                     trigger_result
                 else if (slot.cancel_reason != 0)
@@ -1816,6 +1902,7 @@ fn finishAllOwnedRequests(controller: *ControllerState, trigger_handle: u64, tri
             releaseController(controller);
         }
     }
+    return !controllerOwnsRequests(controller);
 }
 
 fn resetQueueMemoryAndSoftware(controller: *ControllerState) void {
@@ -1999,6 +2086,7 @@ fn shutdownController(controller: *ControllerState, ctx: *const r4os.r4dev.Drive
     const work_safe = releaseDriverWork(controller, ctx);
 
     var stopped = true;
+    var requests_safe = !@atomicLoad(bool, &controller.cleanup_retained, .acquire);
     if (controller.mapped) {
         // The block owner has already stopped admissions and proved every
         // registered namespace quiescent before invoking this finalizer.  A
@@ -2006,15 +2094,17 @@ fn shutdownController(controller: *ControllerState, ctx: *const r4os.r4dev.Drive
         // therefore safe convenience steps.  CC.EN=0 remains the hard DMA
         // safety boundary if either step fails.
         for (controller.namespaces[0..controller.namespace_count]) |*namespace| {
-            if (!namespace.identity.usable or !namespace.block_registered) continue;
+            if (!namespace.identity.usable or !namespace.block_registered or @atomicLoad(bool, &controller.cleanup_retained, .acquire)) continue;
             _ = syncIo(namespace, r4os.abi.storage_request_op_flush, 0, 0, 0, 0, true);
         }
         if (!controllerOwnsRequests(controller)) deleteIoQueuesBestEffort(controller);
         stopped = disableController(controller);
         if (stopped) {
-            finishAllOwnedRequests(controller, 0, r4os.abi.storage_request_result_shutdown);
-            resetQueueMemoryAndSoftware(controller);
-            resetAdminMemoryAndSoftware(controller);
+            requests_safe = finishAllOwnedRequests(controller, 0, r4os.abi.storage_request_result_shutdown) and requests_safe;
+            if (requests_safe) {
+                resetQueueMemoryAndSoftware(controller);
+                resetAdminMemoryAndSoftware(controller);
+            }
             write32(controller, REG_AQA, 0);
             write64(controller, REG_ASQ, 0);
             write64(controller, REG_ACQ, 0);
@@ -2022,7 +2112,7 @@ fn shutdownController(controller: *ControllerState, ctx: *const r4os.r4dev.Drive
     }
     const irq_safe = unregisterInterrupts(controller, ctx);
     const bus_master_safe = disablePciBusMaster(controller, ctx);
-    const safe = stopped and work_safe and irq_safe and bus_master_safe;
+    const safe = stopped and work_safe and irq_safe and bus_master_safe and requests_safe and !@atomicLoad(bool, &controller.cleanup_retained, .acquire);
     if (safe) {
         for (controller.queues[0..controller.queue_pair_count]) |*queue| {
             if (queue.region.phys_addr != 0) ctx.freeDmaRegion(&queue.region);

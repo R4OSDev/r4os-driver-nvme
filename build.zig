@@ -22,4 +22,6 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run deterministic NVMe deadline and recovery-state tests");
     test_step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_state_tests.step);
+    const cleanup_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/dma_cleanup.zig"), .target = b.graph.host, .optimize = .Debug }) });
+    test_step.dependOn(&b.addRunArtifact(cleanup_tests).step);
 }

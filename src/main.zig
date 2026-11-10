@@ -1,7 +1,7 @@
 const std = @import("std");
 const r4os = @import("r4os");
 const nvme_state = @import("nvme_state.zig");
-const dma_cleanup = @import("dma_cleanup.zig");
+const dma_cleanup = r4os.driver_dma_cleanup;
 const observation = @import("observation.zig");
 
 const CLASS_MASS_STORAGE: u8 = 0x01;
@@ -187,7 +187,7 @@ const ControllerState = struct {
     cleanup_retained: bool = false,
     used: bool = false,
     index: u8 = 0,
-    api: ?*const r4os.r4dev.DriverApi = null,
+    api: ?*const r4os.r4dev.DriverApi2 = null,
     info: r4os.abi.PciDeviceInfo = .{},
     phase: ControllerPhase = .cold,
     present: bool = false,
@@ -282,19 +282,19 @@ const ControllerState = struct {
     last_sectors: u32 = 0,
 };
 
-var driver_api: ?*const r4os.r4dev.DriverApi = null;
+var driver_api: ?*const r4os.r4dev.DriverApi2 = null;
 var controllers: [MAX_CONTROLLERS]ControllerState = .{ControllerState{}} ** MAX_CONTROLLERS;
 var controller_count: usize = 0;
 var registered_backends: usize = 0;
 var next_sync_sequence: u64 = 1;
 
 comptime {
-    asm (r4os.r4dev.driverEntriesAsm("nvme_init", "nvme_shutdown"));
+    asm (r4os.technical2.driverEntriesAsm("nvme_init", "nvme_shutdown"));
 }
 
-export fn nvme_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
-    var ctx = r4os.r4dev.DriverContext.init(api);
-    if (!ctx.apiCompatible()) {
+export fn nvme_init(api: *const r4os.r4dev.DriverApi2) callconv(.c) i32 {
+    var ctx = r4os.r4dev.DriverContext2.init(api);
+    if (!ctx.apiCompatible() or !ctx.requires(.{ "alloc_dma_region", "alloc_dma_region_constrained", "dma_map_pinned", "dma_pin_buffer", "dma_unmap", "dma_unpin_buffer", "driver_completion_release", "driver_completion_status", "driver_completion_wait", "driver_work_cancel", "driver_work_submit", "free_dma_region", "irq_register", "irq_unregister", "log_error", "log_info", "log_warn", "pci_disable_msi", "pci_enable_bus_master", "pci_enable_msi", "pci_find_by_class", "pci_map_bar", "pci_read_config32", "pci_write_config32", "register_storage_backend", "storage_backend_recovery_begin", "storage_backend_recovery_finish", "tick_count", "timer_frequency", "wait_ticks" })) {
         ctx.logError("NVME.R4D driver api mismatch");
         return -3;
     }
@@ -349,7 +349,7 @@ export fn nvme_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
 
 export fn nvme_shutdown() callconv(.c) i32 {
     const api = driver_api orelse return 0;
-    var ctx = r4os.r4dev.DriverContext.init(api);
+    var ctx = r4os.r4dev.DriverContext2.init(api);
     return if (shutdownAllControllers(&ctx)) 0 else -1;
 }
 
@@ -362,7 +362,7 @@ fn resetDriverState() void {
 }
 
 fn discoverControllers(
-    ctx: *const r4os.r4dev.DriverContext,
+    ctx: *const r4os.r4dev.DriverContext2,
     out: *[MAX_CONTROLLERS]r4os.abi.PciDeviceInfo,
     out_count: *usize,
 ) bool {
@@ -382,7 +382,7 @@ fn discoverControllers(
     }
 }
 
-fn initializeController(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext) bool {
+fn initializeController(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext2) bool {
     if (ctx.pciEnableBusMaster(controller.info, r4os.abi.pci_enable_memory_space) != 0) {
         return failController(controller, 1);
     }
@@ -429,7 +429,7 @@ fn initializeController(controller: *ControllerState, ctx: *const r4os.r4dev.Dri
     return true;
 }
 
-fn allocateAdminRegion(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext) bool {
+fn allocateAdminRegion(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext2) bool {
     const bytes = ADMIN_REGION_PAGES * PAGE_SIZE;
     if (ctx.allocDmaRegion(bytes, PAGE_SIZE, &controller.admin_region) != 0) return false;
     return controller.admin_region.phys_addr != 0 and controller.admin_region.virt_addr != 0 and
@@ -462,7 +462,7 @@ fn configureAdminQueue(controller: *ControllerState) void {
     controller.admin_pending = false;
 }
 
-fn setupInterrupts(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext) bool {
+fn setupInterrupts(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext2) bool {
     maskRuntimeInterrupts(controller);
     controller.msi_enabled = false;
     controller.irq_registered = false;
@@ -512,7 +512,7 @@ fn setupInterrupts(controller: *ControllerState, ctx: *const r4os.r4dev.DriverCo
     return true;
 }
 
-fn prepareMsixVectorMask(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext) MsixMaskPreparation {
+fn prepareMsixVectorMask(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext2) MsixMaskPreparation {
     const status_command = ctx.pciReadConfig32(controller.info, 0x04);
     if (status_command == 0xFFFF_FFFF or (status_command & (@as(u32, 1) << 20)) == 0) return .not_needed;
 
@@ -660,12 +660,13 @@ fn pollAdminCompletion(controller: *ControllerState, expected_cid: u16) AdminRes
     const ctx = controllerContext(controller);
     const start = ctx.tickCount();
     const timeout = nvme_state.adminTimeoutTicks(controller.timer_hz);
+    var poll = r4os.driver_poll_budget.DriverPollBudget.initIterations(1_000_000, .task);
     while (true) {
         const dw3 = adminCqDword(controller, controller.admin_cq.head, 3);
         const visible = completionPhase(dw3) == controller.admin_cq.phase;
         const csts = read32(controller, REG_CSTS);
         controller.csts = csts;
-        switch (nvme_state.pollDecision(visible, (csts & CSTS_CFS) != 0, nvme_state.deadlineExpired(start, timeout, ctx.tickCount()))) {
+        switch (nvme_state.pollDecision(visible, (csts & CSTS_CFS) != 0, (poll.step(null, false) != .proceed or nvme_state.deadlineExpired(start, timeout, ctx.tickCount())))) {
             .completion => {
                 const result_dw0 = adminCqDword(controller, controller.admin_cq.head, 0);
                 const cid = completionCid(dw3);
@@ -824,7 +825,7 @@ fn identifyNamespace(controller: *ControllerState, nsid: u32, out: *NamespaceIde
     return true;
 }
 
-fn initializeIoQueues(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext) bool {
+fn initializeIoQueues(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext2) bool {
     controller.requested_queue_pairs = @intCast(@min(controller.usable_namespace_count, MAX_IO_QUEUES));
     const requested_zero = controller.requested_queue_pairs - 1;
     const request_value = @as(u32, requested_zero) | (@as(u32, requested_zero) << 16);
@@ -899,7 +900,7 @@ fn assignNamespacesToQueues(controller: *ControllerState) void {
     }
 }
 
-fn registerNamespaceBackends(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext) bool {
+fn registerNamespaceBackends(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext2) bool {
     for (controller.namespaces[0..controller.namespace_count]) |*namespace| {
         if (!namespace.identity.usable) continue;
         const queue = &controller.queues[namespace.queue_index];
@@ -983,7 +984,7 @@ fn storageFlush(raw: ?*anyopaque) callconv(.c) i32 {
 fn storageShutdown(raw: ?*anyopaque) callconv(.c) i32 {
     _ = raw;
     const api = driver_api orelse return 0;
-    var ctx = r4os.r4dev.DriverContext.init(api);
+    var ctx = r4os.r4dev.DriverContext2.init(api);
     return if (shutdownAllControllers(&ctx)) 0 else -1;
 }
 
@@ -1251,7 +1252,7 @@ fn releaseSlotBuffers(controller: *ControllerState, slot: *IoSlot) bool {
     }
     if (slot.shared_buffer) |buffer| {
         slot.shared_buffer = null;
-        buffer.release(&ctx);
+        ctx.releaseSharedDmaBuffer(buffer);
     }
     return true;
 }
@@ -1472,7 +1473,7 @@ fn logIrqAcceptanceOnce(controller: *ControllerState) void {
         "[NVMEIRQ] result=OK mode=msi irq=nonzero work=nonzero completions=nonzero poll_fallback=0");
 }
 
-fn releaseCompletedWork(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext) void {
+fn releaseCompletedWork(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext2) void {
     for (&controller.work_handles) |*stored| {
         const handle = @atomicLoad(u32, stored, .acquire);
         if (handle == 0) continue;
@@ -1846,13 +1847,14 @@ fn waitForControllerWorkIdle(controller: *ControllerState) bool {
     const ctx = controllerContext(controller);
     const start = ctx.tickCount();
     const timeout = nvme_state.adminTimeoutTicks(controller.timer_hz);
+    var poll = r4os.driver_poll_budget.DriverPollBudget.initIterations(1_000_000, .task);
     // Driver Work owns one serial normal-callback lane. Include a queued
     // successor in the join so external reset cannot slip through the short
     // handoff between callbacks.
     while (@atomicLoad(bool, &controller.work_active, .acquire) or
         @atomicLoad(bool, &controller.work_pending, .acquire))
     {
-        if (nvme_state.deadlineExpired(start, timeout, ctx.tickCount())) return false;
+        if ((poll.step(null, false) != .proceed or nvme_state.deadlineExpired(start, timeout, ctx.tickCount()))) return false;
         ctx.waitTicks(1);
     }
     return true;
@@ -1862,6 +1864,7 @@ fn waitForPreparingSlots(controller: *ControllerState) bool {
     const ctx = controllerContext(controller);
     const start = ctx.tickCount();
     const timeout = nvme_state.adminTimeoutTicks(controller.timer_hz);
+    var poll = r4os.driver_poll_budget.DriverPollBudget.initIterations(1_000_000, .task);
     while (true) {
         var preparing = false;
         if (!acquireController(controller)) return false;
@@ -1872,7 +1875,7 @@ fn waitForPreparingSlots(controller: *ControllerState) bool {
         }
         releaseController(controller);
         if (!preparing) return true;
-        if (nvme_state.deadlineExpired(start, timeout, ctx.tickCount())) return false;
+        if ((poll.step(null, false) != .proceed or nvme_state.deadlineExpired(start, timeout, ctx.tickCount()))) return false;
         ctx.waitTicks(1);
     }
 }
@@ -1987,8 +1990,8 @@ fn syncIo(
     defer @atomicStore(bool, &controller.sync_busy, false, .release);
     if (!validateTransfer(namespace, operation, lba, sectors, buffer_bytes, buffer_addr)) return -3;
     const ctx = controllerContext(controller);
-    const buffer = if (operation == r4os.abi.storage_request_op_flush) null else r4os.r4dev.SharedDmaBuffer.create(&ctx, buffer_bytes, std.math.maxInt(u64)) orelse return -3;
-    defer if (buffer) |owned| owned.release(&ctx);
+    const buffer = if (operation == r4os.abi.storage_request_op_flush) null else ctx.createSharedDmaBuffer(buffer_bytes, std.math.maxInt(u64)) orelse return -3;
+    defer if (buffer) |owned| ctx.releaseSharedDmaBuffer(owned);
     if (operation == r4os.abi.storage_request_op_write) {
         const source: [*]const u8 = @ptrFromInt(buffer_addr);
         @memcpy(buffer.?.data(), source[0..buffer_bytes]);
@@ -2064,7 +2067,7 @@ fn finishSyncClaim(controller: *ControllerState, handle: u64) void {
     }
 }
 
-fn shutdownAllControllers(ctx: *const r4os.r4dev.DriverContext) bool {
+fn shutdownAllControllers(ctx: *const r4os.r4dev.DriverContext2) bool {
     var safe = true;
     var index = controller_count;
     while (index != 0) {
@@ -2074,7 +2077,7 @@ fn shutdownAllControllers(ctx: *const r4os.r4dev.DriverContext) bool {
     return safe;
 }
 
-fn shutdownController(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext) bool {
+fn shutdownController(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext2) bool {
     if (controller.shutdown_done) return controller.shutdown_safe;
     @atomicStore(bool, &controller.accepting, false, .release);
     @atomicStore(bool, &controller.shutting_down, true, .release);
@@ -2141,7 +2144,7 @@ fn deleteIoQueuesBestEffort(controller: *ControllerState) void {
     }
 }
 
-fn releaseDriverWork(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext) bool {
+fn releaseDriverWork(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext2) bool {
     @atomicStore(bool, &controller.work_pending, false, .release);
     var safe = true;
     for (&controller.work_handles) |*stored| {
@@ -2166,7 +2169,7 @@ fn releaseDriverWork(controller: *ControllerState, ctx: *const r4os.r4dev.Driver
     return safe;
 }
 
-fn unregisterInterrupts(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext) bool {
+fn unregisterInterrupts(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext2) bool {
     if (controller.irq_registered) {
         if (controller.irq_route >= 32 or
             ctx.irqUnregister(controller.irq_route, irqHandler, @intFromPtr(controller)) != 0)
@@ -2185,7 +2188,7 @@ fn unregisterInterrupts(controller: *ControllerState, ctx: *const r4os.r4dev.Dri
     return true;
 }
 
-fn disablePciBusMaster(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext) bool {
+fn disablePciBusMaster(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext2) bool {
     if (!controller.present) return true;
     const raw = ctx.pciReadConfig32(controller.info, 0x04);
     if (raw == 0xFFFF_FFFF) return false;
@@ -2203,10 +2206,13 @@ fn validateTransfer(namespace: *const NamespaceRuntime, operation: u32, lba: u64
         r4os.abi.storage_request_op_read, r4os.abi.storage_request_op_write => {},
         else => return false,
     }
-    if (sectors == 0 or sectors > namespace.max_sectors or sectors > std.math.maxInt(u16) or buffer_addr == 0) return false;
-    const expected = std.math.mul(u64, sectors, namespace.identity.sector_size) catch return false;
-    if (expected != bytes or expected > MAX_TRANSFER_BYTES) return false;
-    if (lba >= namespace.identity.sector_count or sectors > namespace.identity.sector_count - lba) return false;
+    if (buffer_addr == 0) return false;
+    _ = r4os.block_transfer.validate(lba, sectors, namespace.identity.sector_size, bytes, .{
+        .capacity_blocks = namespace.identity.sector_count,
+        .max_blocks = @min(namespace.max_sectors, std.math.maxInt(u16)),
+        .max_bytes = MAX_TRANSFER_BYTES,
+        .lba_bits = 64,
+    }) catch return false;
     return true;
 }
 
@@ -2251,8 +2257,8 @@ fn controllerForNamespace(namespace: *const NamespaceRuntime) ?*ControllerState 
     return controller;
 }
 
-fn controllerContext(controller: *const ControllerState) r4os.r4dev.DriverContext {
-    return r4os.r4dev.DriverContext.init(controller.api.?);
+fn controllerContext(controller: *const ControllerState) r4os.r4dev.DriverContext2 {
+    return r4os.r4dev.DriverContext2.init(controller.api.?);
 }
 
 fn acquireController(controller: *ControllerState) bool {
@@ -2295,13 +2301,14 @@ fn waitReady(controller: *ControllerState, want_ready: bool) bool {
     const ctx = controllerContext(controller);
     const start = ctx.tickCount();
     const timeout = nvme_state.controllerTimeoutTicks(controller.timer_hz, controller.timeout_units);
+    var poll = r4os.driver_poll_budget.DriverPollBudget.initIterations(1_000_000, .task);
     while (true) {
         const csts = read32(controller, REG_CSTS);
         controller.csts = csts;
         const ready = (csts & CSTS_RDY) != 0;
         if (ready == want_ready) return true;
         if (want_ready and (csts & CSTS_CFS) != 0) return false;
-        if (nvme_state.deadlineExpired(start, timeout, ctx.tickCount())) {
+        if ((poll.step(null, false) != .proceed or nvme_state.deadlineExpired(start, timeout, ctx.tickCount()))) {
             controller.admin_timeouts +%= 1;
             return false;
         }
@@ -2309,7 +2316,7 @@ fn waitReady(controller: *ControllerState, want_ready: bool) bool {
     }
 }
 
-fn ensureDoorbellMapping(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext, highest_qid: u16) bool {
+fn ensureDoorbellMapping(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext2, highest_qid: u16) bool {
     const required = requiredMmioBytes(controller, highest_qid) orelse return false;
     if (controller.mapped_bytes >= required) return true;
     var expanded: r4os.abi.MmioRegion = .{};
